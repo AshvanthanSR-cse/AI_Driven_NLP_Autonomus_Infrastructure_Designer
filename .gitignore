@@ -1,0 +1,23 @@
+# Secrets - never commit
+.env
+.env.example
+*.pem
+*.ppk
+*.key
+id_rsa*
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Terraform / runtime
+.terraform/
+*.tfstate
+*.tfstate.*
+tfplan
+downloads/
+Admin Access Key.txt
+CLAUDE.md
+LLM_Testing.py
