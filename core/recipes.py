@@ -6,8 +6,10 @@ AWS calls, local tools (docker / terraform / kubectl / eksctl), ECR login, Ansib
 rest, generates files from FIXED templates into the workspace folder, adds tags, cost notes and undo
 actions (teardown). Nothing runs until the user approves the script on the Scripts page.
 
-Recipes: iam_role, lambda_function, docker_image, ecs_fargate_service, eks_cluster, jenkins_server,
-         ansible_website, ansible_playbook, terraform_project, s3_upload, s3_static_website, database.
+Recipes: iam_role, docker_image, jenkins_server, ansible_website, ansible_playbook,
+         terraform_project, s3_upload, s3_static_website, database. More recipes live in recipes_compute.py
+         (load balancers, Auto Scaling, launch templates, AMI, EBS), recipes_containers.py (ECS, EKS, ECR),
+         recipes_network.py (VPC), recipes_storage.py (S3, Glacier, CloudFront) and recipes_lambda.py.
 """
 import json
 import re
@@ -19,7 +21,7 @@ from core.config import settings
 from core.cron import AwsCron, CronError, describe_rate, expression_kind, parse_rate
 from core.local_steps import StepError, upload_plan, which
 from core.scripts import ScriptDraft
-from core.templates import (FieldSpec, HOURS_PER_MONTH, OS_CHOICES, PUBLIC_IPV4_HOURLY, Template, TemplateError,
+from core.templates import (FieldSpec, HOURS_PER_MONTH, PUBLIC_IPV4_HOURLY, Template, TemplateError,
                             _choice, _int, _key_options, _admin_default, _validate_admin_cidr, _yes_no)
 from core.workspace import WorkspaceError
 
@@ -340,99 +342,6 @@ def _lambda_notes(inputs) -> list[str]:
     return notes
 
 
-def _build_lambda(env, v) -> ScriptDraft:
-    name, folder = v["name"], Path(v["source_folder"])
-    d = workspace.new_task_dir(f"lambda-{name}")
-    try:
-        scan = workspace.zip_folder(folder, d / "function.zip")
-    except WorkspaceError as e:
-        raise TemplateError(str(e)) from None
-    zip_ref = f"@file:{d / 'function.zip'}"
-    existing = env.lambda_function(name)
-    steps: list[dict] = []
-    if existing:
-        steps.append(aws_step("lambda", "update_function_code", {"FunctionName": name, "ZipFile": zip_ref},
-                              f"Upload new code to the existing function {name} ({len(scan['files'])} files)",
-                              wait={"waiter": "function_updated_v2", "params": {"FunctionName": name}}))
-        fn_arn = existing["FunctionArn"]
-        title = f"Update Lambda {name} code"
-    else:
-        if v["role"] == "new":
-            role_name = f"{name}-lambda-role"[:64]
-            steps += role_steps(role_name, "lambda.amazonaws.com", [MANAGED_POLICIES["AWSLambdaBasicExecutionRole"]])
-            role_arn = "{{role.Role.Arn}}"
-        else:
-            role_arn = v["role"]
-        steps.append(aws_step(
-            "lambda", "create_function",
-            {"FunctionName": name, "Runtime": v["runtime"], "Role": role_arn, "Handler": v["handler"],
-             "Code": {"ZipFile": zip_ref}, "MemorySize": v["memory_mb"], "Timeout": v["timeout_s"],
-             "Description": "Created by Kintsugi", "Tags": tag_dict(name)},
-            f"Create Lambda function {name} ({v['runtime']}, handler {v['handler']}, {len(scan['files'])} files)",
-            save_as="fn", wait={"waiter": "function_active_v2", "params": {"FunctionName": name}},
-            undo=undo("lambda", "delete_function", {"FunctionName": name}, f"Delete Lambda function {name}")))
-        fn_arn = "{{fn.FunctionArn}}"
-        title = f"Create Lambda {name} from {folder.name}"
-    if v["schedule"] != "none":
-        rule = f"{name}-schedule"[:64]
-        steps += [
-            aws_step("events", "put_rule", {"Name": rule, "ScheduleExpression": v["schedule"], "State": "ENABLED",
-                                            "Description": f"Kintsugi schedule for {name}", "Tags": tag_list(rule)},
-                     f"Create EventBridge schedule {rule}: {v['schedule']}", save_as="rule",
-                     undo=undo("events", "delete_rule", {"Name": rule}, f"Delete schedule {rule}")),
-            aws_step("lambda", "add_permission",
-                     {"FunctionName": name, "StatementId": f"kintsugi-{rule}"[:100], "Action": "lambda:InvokeFunction",
-                      "Principal": "events.amazonaws.com", "SourceArn": "{{rule.RuleArn}}"},
-                     "Allow EventBridge to invoke the function"),
-            aws_step("events", "put_targets", {"Rule": rule, "Targets": [{"Id": "1", "Arn": fn_arn}]},
-                     f"Point the schedule at {name}",
-                     undo=undo("events", "remove_targets", {"Rule": rule, "Ids": ["1"]}, "Remove the schedule target")),
-        ]
-        title += f" (schedule {v['schedule']})"
-    notes = _lambda_notes(v) + scan["warnings"] + [f"Code package: {d / 'function.zip'}"]
-    if existing:
-        notes.append("The function already exists: only its code is replaced (settings stay the same).")
-    return ScriptDraft(title=title, steps=steps, notes=notes)
-
-
-LAMBDA = Template(
-    name="lambda_function",
-    description="Create (or update the code of) a Lambda function from a local folder, optional schedule",
-    fields=[
-        FieldSpec("name", "What is the function name?", "text", default="kintsugi-function",
-                  validate=_name_validator(r"[A-Za-z0-9_-]{1,64}", "letters, numbers, - and _ (max 64)")),
-        FieldSpec("source_folder", "Which local folder has the function code?", "folder", must_ask=True,
-                  validate=_folder, why="The folder is zipped (secret files like .env and keys are skipped)."),
-        FieldSpec("runtime", "Which runtime?", "choice",
-                  default=lambda e, i: _guess_runtime(_src(i)) if _src(i) else "python3.12",
-                  options=lambda e, i: [{"value": r, "label": r} for r in RUNTIMES],
-                  validate=lambda e, i, v: _choice([{"value": r, "label": r} for r in RUNTIMES], v, "runtime"),
-                  relevant_env=lambda e, i: not _lambda_exists(e, i)),
-        FieldSpec("handler", "Which handler (file.function)?", "text",
-                  default=lambda e, i: _guess_handler(_src(i), i.get("runtime", "python3.12")) if _src(i) else None,
-                  validate=_validate_handler, relevant_env=lambda e, i: not _lambda_exists(e, i),
-                  why="Python: lambda_function.lambda_handler means def lambda_handler in lambda_function.py"),
-        FieldSpec("role", "Which IAM role should the function run as?", "choice", default="new",
-                  options=_role_options("lambda.amazonaws.com", "basic logging permissions"),
-                  validate=_validate_role("lambda.amazonaws.com", "basic logging permissions"),
-                  relevant_env=lambda e, i: not _lambda_exists(e, i),
-                  why="A new role gets only CloudWatch Logs access (AWSLambdaBasicExecutionRole)."),
-        FieldSpec("memory_mb", "Memory (MB)?", "number", default=128,
-                  validate=lambda e, i, v: _int(v, 128, 3008, "memory"),
-                  relevant_env=lambda e, i: not _lambda_exists(e, i)),
-        FieldSpec("timeout_s", "Timeout (seconds)?", "number", default=30,
-                  validate=lambda e, i, v: _int(v, 1, 900, "timeout"),
-                  relevant_env=lambda e, i: not _lambda_exists(e, i)),
-        FieldSpec("schedule", f"Run it on a schedule? (none, 'daily 10:00' in {settings.app_timezone}, "
-                              "'hourly', cron(...) in UTC, or rate(...))", "text",
-                  default="none", validate=_validate_schedule,
-                  why="'daily 10:00' is converted to UTC by the app (10:00 IST = cron(30 4 * * ? *))."),
-    ],
-    title=lambda i: f"Lambda function '{i.get('name', 'kintsugi-function')}'",
-    build=_build_lambda, notes=_lambda_notes,
-)
-
-
 def docker_context(value) -> tuple[Path, str]:
     """A folder with a Dockerfile, or the Dockerfile itself (e.g. an attached file) -> (build folder, file name)."""
     raw = str(value).strip().strip('"')
@@ -458,7 +367,8 @@ def _docker_port_default(env, inputs):
         return 80
 
 
-def image_steps(env, repo: str, path: str) -> tuple[list[dict], str, list[str]]:
+def image_steps(env, repo: str, path: str, platform: str = "linux/amd64", immutable: bool = False,
+                extra_build_args: list[str] | None = None) -> tuple[list[dict], str, list[str]]:
     """ECR repository (if missing) + docker build/login/push. Returns (steps, image URI, warnings)."""
     _check_tools("docker")
     ctx, dockerfile = docker_context(path)
@@ -471,12 +381,12 @@ def image_steps(env, repo: str, path: str) -> tuple[list[dict], str, list[str]]:
     if not env.ecr_repo_uri(repo):
         steps.append(aws_step("ecr", "create_repository",
                               {"repositoryName": repo, "imageScanningConfiguration": {"scanOnPush": True},
-                               "imageTagMutability": "MUTABLE", "tags": tag_list(repo)},
+                               "imageTagMutability": "IMMUTABLE" if immutable else "MUTABLE", "tags": tag_list(repo)},
                               f"Create ECR repository {repo} (image scanning on push)", save_as="repo",
                               undo=undo("ecr", "delete_repository", {"repositoryName": repo, "force": True},
                                         f"Delete ECR repository {repo} and its images")))
     steps += [
-        cmd("docker", ["build", "--platform", "linux/amd64", "-t", image, "-f", dockerfile, "."],
+        cmd("docker", ["build", "--platform", platform, *(extra_build_args or []), "-t", image, "-f", dockerfile, "."],
             f"Build the image from {folder} ({dockerfile}, on this computer)", cwd=folder, timeout=3600),
         {"kind": "ecr_login", "repository_uri": uri, "description": "Log Docker in to ECR (temporary password)"},
         cmd("docker", ["push", image], f"Push the image to ECR ({repo})", timeout=3600),
@@ -501,323 +411,6 @@ DOCKER_IMAGE = Template(
     ],
     title=lambda i: f"Docker image '{i.get('repository', 'kintsugi-app')}'",
     build=_build_docker_image, notes=lambda i: ["COST: ECR storage ~$0.10 per GB-month."],
-)
-
-
-SIZES = {"256/512": (0.25, 0.5), "512/1024": (0.5, 1.0), "1024/2048": (1.0, 2.0)}
-
-
-def _public_subnet_options(env, inputs):
-    return [{"value": s["id"], "label": f"{s['id']} · {s['az']} · {s['cidr']} · {s['vpc_name'] or s['vpc']}"
-                                         f"{' · ' + s['name'] if s['name'] else ''}"}
-            for s in env.subnets() if s["public"]]
-
-
-def _validate_public_subnets(min_azs: int):
-    def check(env, inputs, v):
-        ids = [x.strip() for x in (v if isinstance(v, list) else str(v).split(",")) if str(x).strip()]
-        subs = {s["id"]: s for s in env.subnets() if s["public"]}
-        bad = [x for x in ids if x not in subs]
-        if bad:
-            raise ValueError(f"not a public subnet in this region: {', '.join(bad)}")
-        if not ids:
-            raise ValueError("pick at least one public subnet")
-        if len({subs[x]['vpc'] for x in ids}) > 1:
-            raise ValueError("all subnets must be in the same VPC")
-        if len({subs[x]['az'] for x in ids}) < min_azs:
-            raise ValueError(f"pick subnets in at least {min_azs} different availability zones")
-        return ids
-    return check
-
-
-def _ecs_notes(inputs) -> list[str]:
-    vcpu, gb = SIZES.get(inputs.get("size", "256/512"), (0.25, 0.5))
-    n = int(inputs.get("count", 1) or 1)
-    hourly = n * (vcpu * FARGATE_VCPU_HOUR + gb * FARGATE_GB_HOUR + PUBLIC_IPV4_HOURLY)
-    return [f"COST: {n} Fargate task(s) of {vcpu} vCPU / {gb} GB + public IP ~${hourly:.3f}/hour "
-            f"(~${hourly * HOURS_PER_MONTH:.0f}/month) + ECR storage ~$0.10/GB-month + CloudWatch Logs. "
-            "Approximate us-east-1 prices; verify current pricing. No load balancer and no NAT gateway are created.",
-            "Run the teardown script when you are done testing.",
-            "First ECS use in an account also creates the AWS service-linked role for ECS (needs iam permission)."]
-
-
-def _build_ecs(env, v) -> ScriptDraft:
-    _check_tools("docker")
-    name, port, folder = v["name"], v["container_port"], v["app_folder"]
-    sub = {s["id"]: s for s in env.subnets()}[v["subnets"][0]]
-    steps, image, warns = image_steps(env, name, folder)
-    if v["exec_role"] == "new":
-        steps += role_steps(f"{name}-ecs-exec"[:64], "ecs-tasks.amazonaws.com",
-                            [MANAGED_POLICIES["AmazonECSTaskExecutionRolePolicy"]], key="exec_role")
-        exec_arn = "{{exec_role.Role.Arn}}"
-    else:
-        exec_arn = v["exec_role"]
-    log_group, cluster = f"/ecs/{name}", f"{name}-cluster"
-    cpu, mem = v["size"].split("/")
-    steps += [
-        aws_step("logs", "create_log_group", {"logGroupName": log_group, "tags": tag_dict(name)},
-                 f"Create log group {log_group}",
-                 undo=undo("logs", "delete_log_group", {"logGroupName": log_group}, "Delete the log group")),
-        aws_step("ecs", "create_cluster", {"clusterName": cluster, "tags": tag_list(name, "key", "value")},
-                 f"Create ECS cluster {cluster}", save_as="cluster",
-                 undo=undo("ecs", "delete_cluster", {"cluster": cluster}, f"Delete ECS cluster {cluster}")),
-        aws_step("ec2", "create_security_group",
-                 {"GroupName": f"{name}-ecs-{_stamp()}", "Description": f"Kintsugi ECS service {name}",
-                  "VpcId": sub["vpc"], "TagSpecifications": templates._tags("security-group", f"{name}-ecs-sg")},
-                 f"Create security group for {name}", save_as="sg",
-                 undo=undo("ec2", "delete_security_group", {"GroupId": "{{sg.GroupId}}"}, "Delete the security group")),
-        aws_step("ec2", "authorize_security_group_ingress",
-                 {"GroupId": "{{sg.GroupId}}", "IpPermissions": [
-                     {"IpProtocol": "tcp", "FromPort": port, "ToPort": port,
-                      "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "web app"}]}]},
-                 f"Allow inbound TCP {port} from the internet (the app's port)"),
-        aws_step("ecs", "register_task_definition",
-                 {"family": name, "networkMode": "awsvpc", "requiresCompatibilities": ["FARGATE"],
-                  "cpu": cpu, "memory": mem, "executionRoleArn": exec_arn,
-                  "runtimePlatform": {"cpuArchitecture": "X86_64", "operatingSystemFamily": "LINUX"},
-                  "containerDefinitions": [{
-                      "name": name, "image": image, "essential": True,
-                      "portMappings": [{"containerPort": port, "protocol": "tcp"}],
-                      "logConfiguration": {"logDriver": "awslogs", "options": {
-                          "awslogs-group": log_group, "awslogs-region": env.region_name,
-                          "awslogs-stream-prefix": name}}}],
-                  "tags": tag_list(name, "key", "value")},
-                 f"Register task definition {name} ({cpu} CPU units / {mem} MB)", save_as="td",
-                 undo=undo("ecs", "deregister_task_definition",
-                           {"taskDefinition": "{{td.taskDefinition.taskDefinitionArn}}"}, "Deregister the task definition")),
-        aws_step("ecs", "create_service",
-                 {"cluster": cluster, "serviceName": name, "taskDefinition": "{{td.taskDefinition.taskDefinitionArn}}",
-                  "desiredCount": v["count"], "launchType": "FARGATE",
-                  "networkConfiguration": {"awsvpcConfiguration": {
-                      "subnets": v["subnets"], "securityGroups": ["{{sg.GroupId}}"], "assignPublicIp": "ENABLED"}},
-                  "tags": tag_list(name, "key", "value"), "propagateTags": "SERVICE"},
-                 f"Create Fargate service {name} with {v['count']} task(s) (waits until stable)", save_as="svc",
-                 wait={"waiter": "services_stable", "params": {"cluster": cluster, "services": [name]},
-                       "delay": 15, "max_attempts": 60},
-                 undo=undo("ecs", "delete_service", {"cluster": cluster, "service": name, "force": True},
-                           f"Delete service {name} (waits until gone)",
-                           wait={"waiter": "services_inactive", "params": {"cluster": cluster, "services": [name]}},
-                           pause_after=45)),
-        check("ecs_url", {"cluster": cluster, "service": name, "port": port, "path": v.get("path", "/")},
-              "Check that the app answers on its public IP", timeout=600),
-    ]
-    return ScriptDraft(title=f"Run {docker_context(folder)[0].name} on ECS Fargate as {name}", steps=steps,
-                       notes=_ecs_notes(v) + [f"Image: {image}", "Docker Desktop must be running."] + warns)
-
-
-ECS_FARGATE = Template(
-    name="ecs_fargate_service",
-    description="Build a local Dockerfile, push to ECR and run it on ECS Fargate with a public IP",
-    fields=[
-        FieldSpec("app_folder", "Which Dockerfile (or the folder that has it)?", "path", must_ask=True,
-                  validate=_validate_docker_folder, why="The Dockerfile's folder is the build context."),
-        FieldSpec("name", "Name for the app (used for ECR, cluster, service)?", "text", default="kintsugi-app",
-                  validate=_name_validator(r"[a-z][a-z0-9-]{1,30}", "lowercase letters, numbers and - (max 31)")),
-        FieldSpec("container_port", "Which port does the app listen on inside the container?", "number",
-                  must_ask=True, default=_docker_port_default, validate=lambda e, i, v: _int(v, 1, 65535, "port"),
-                  why="Taken from EXPOSE in the Dockerfile when present. This port is opened to the internet."),
-        FieldSpec("subnets", "Which public subnets should the tasks run in?", "multichoice", must_ask=True,
-                  options=_public_subnet_options, validate=_validate_public_subnets(1),
-                  default=lambda e, i: [o["value"] for o in _public_subnet_options(e, i)][:2],
-                  empty_hint="No public subnets in this region. First ask: 'Create a VPC with 2 public subnets', "
-                             "run that script, then try again."),
-        FieldSpec("exec_role", "Task execution role (lets ECS pull the image and write logs)?", "choice",
-                  default="new", options=_role_options("ecs-tasks.amazonaws.com", "AmazonECSTaskExecutionRolePolicy"),
-                  validate=_validate_role("ecs-tasks.amazonaws.com", "AmazonECSTaskExecutionRolePolicy")),
-        FieldSpec("size", "Task size (CPU units / memory MB)?", "choice", default="256/512",
-                  options=lambda e, i: [{"value": k, "label": f"{k} ({c} vCPU, {m} GB)"} for k, (c, m) in SIZES.items()],
-                  validate=lambda e, i, v: _choice([{"value": k, "label": k} for k in SIZES], v, "size")),
-        FieldSpec("count", "How many copies (tasks)?", "number", default=1, validate=lambda e, i, v: _int(v, 1, 3, "tasks")),
-    ],
-    title=lambda i: f"ECS Fargate app '{i.get('name', 'kintsugi-app')}'",
-    build=_build_ecs, notes=_ecs_notes,
-)
-
-
-APP_SOURCES = [
-    {"value": "dockerfile", "label": "A folder with a Dockerfile: build it, push to ECR, deploy with a public load balancer"},
-    {"value": "manifests", "label": "A folder of Kubernetes YAML manifests: kubectl apply them"},
-    {"value": "none", "label": "No app, just the cluster"},
-]
-NODE_TYPES = ["t3.small", "t3.medium"]
-
-
-def _eks_hourly(inputs) -> float:
-    n = int(inputs.get("nodes", 2) or 2)
-    node = EC2_HOURLY.get(inputs.get("node_type", "t3.medium"), 0.0416)
-    lb = CLASSIC_LB_HOUR if inputs.get("app_source") == "dockerfile" else 0
-    return EKS_CONTROL_PLANE_HOUR + n * (node + PUBLIC_IPV4_HOURLY) + lb
-
-
-def _eks_notes(inputs) -> list[str]:
-    h = _eks_hourly(inputs)
-    return [f"COST WARNING: EKS control plane ~${EKS_CONTROL_PLANE_HOUR}/hour + nodes + load balancer ~ "
-            f"${h:.2f}/hour (~${h * 24:.1f}/day, ~${h * HOURS_PER_MONTH:.0f}/month). A $5 budget is used up in "
-            f"about {5 / h:.0f} hours. Run the teardown script right after testing. Approximate us-east-1 prices.",
-            "Creating the cluster takes 15-25 minutes; deleting it takes about 10-15 minutes.",
-            "eksctl creates IAM roles and CloudFormation stacks: your Write connection needs IAM, EC2, EKS and "
-            "CloudFormation permissions.",
-            "A new VPC made by eksctl has NO NAT gateway here (nodes get public IPs) to save money."]
-
-
-def _validate_cost_ok(env, inputs, v) -> str:
-    if _yes_no(v) != "yes":
-        raise ValueError("cancelled: nothing will be created")
-    return "yes"
-
-
-def _validate_manifests(env, inputs, v) -> str:
-    folder = workspace.user_folder(v)
-    files = [p for p in folder.rglob("*") if p.suffix.lower() in (".yaml", ".yml")]
-    if not files:
-        raise ValueError("no .yaml/.yml files in that folder")
-    return str(folder)
-
-
-def _validate_app_folder(env, inputs, v) -> str:
-    if inputs.get("app_source") == "manifests":
-        return _validate_manifests(env, inputs, v)
-    return _validate_docker_folder(env, inputs, v)
-
-
-def _eksctl_config(v, region: str) -> str:
-    tags = "\n".join(f"    {k}: \"{val}\"" for k, val in tag_dict(v["name"]).items())
-    if v["network"] == "new":
-        vpc = "vpc:\n  nat:\n    gateway: Disable\n"
-    else:
-        lines = [f"      {s['az']}: {{ id: {s['id']} }}" for s in v["_subnets"]]
-        vpc = "vpc:\n  subnets:\n    public:\n" + "\n".join(lines) + "\n"
-    n = v["nodes"]
-    return (f"# Generated by Kintsugi from a fixed template. Used by: eksctl create cluster -f cluster.yaml\n"
-            f"apiVersion: eksctl.io/v1alpha5\nkind: ClusterConfig\nmetadata:\n  name: {v['name']}\n"
-            f"  region: {region}\n  tags:\n{tags}\n{vpc}"
-            f"managedNodeGroups:\n  - name: {v['name']}-nodes\n    instanceType: {v['node_type']}\n"
-            f"    desiredCapacity: {n}\n    minSize: 1\n    maxSize: {n}\n    volumeSize: 20\n"
-            f"    tags:\n{tags.replace('    ', '      ')}\n")
-
-
-def k8s_app_manifest(name: str, image: str, port: int) -> str:
-    return f"""# Generated by Kintsugi from a fixed template.
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {name}
-  labels: {{app: {name}}}
-spec:
-  replicas: 1
-  selector:
-    matchLabels: {{app: {name}}}
-  template:
-    metadata:
-      labels: {{app: {name}}}
-    spec:
-      containers:
-        - name: {name}
-          image: {image}
-          ports:
-            - containerPort: {port}
-          resources:
-            requests: {{cpu: 100m, memory: 128Mi}}
-            limits: {{memory: 512Mi}}
----
-apiVersion: v1
-kind: Service
-metadata:
-  name: {name}
-spec:
-  type: LoadBalancer
-  selector: {{app: {name}}}
-  ports:
-    - port: 80
-      targetPort: {port}
-"""
-
-
-def _build_eks(env, v) -> ScriptDraft:
-    _check_tools("eksctl", "kubectl", "aws", *(["docker"] if v["app_source"] == "dockerfile" else []))
-    name, region = v["name"], env.region_name
-    if v["network"] != "new":
-        subs = {s["id"]: s for s in env.subnets()}
-        v = {**v, "_subnets": [subs[x] for x in v["subnets"]]}
-    d = workspace.new_task_dir(f"eks-{name}")
-    cfg = workspace.write(d / "cluster.yaml", _eksctl_config(v, region))
-    kubeconfig = str(d / "kubeconfig")
-    steps, notes = [], _eks_notes(v) + [f"Files: {d}"]
-    app = None
-    if v["app_source"] == "dockerfile":
-        img_steps, image, warns = image_steps(env, name, v["app_folder"])
-        steps += img_steps
-        notes += warns
-        app = workspace.write(d / "k8s" / "app.yaml", k8s_app_manifest(name, image, v["container_port"]))
-    elif v["app_source"] == "manifests":
-        app = Path(v["app_folder"])
-    if v["network"] != "new":
-        ids = [s["id"] for s in v["_subnets"]]
-        steps.append(aws_step("ec2", "create_tags",
-                              {"Resources": ids, "Tags": [{"Key": "kubernetes.io/role/elb", "Value": "1"}]},
-                              "Tag the subnets so Kubernetes can place public load balancers in them",
-                              undo=undo("ec2", "delete_tags", {"Resources": ids,
-                                                               "Tags": [{"Key": "kubernetes.io/role/elb"}]},
-                                        "Remove the load balancer tag from the subnets")))
-    steps.append(cmd("eksctl", ["create", "cluster", "-f", str(cfg), "--write-kubeconfig=false"],
-                     f"Create EKS cluster {name} with {v['nodes']} x {v['node_type']} nodes (15-25 minutes)",
-                     timeout=3600,
-                     undo_step={"kind": "command", "tool": "eksctl", "timeout": 3600,
-                                "args": ["delete", "cluster", "-f", str(cfg), "--wait", "--disable-nodegroup-eviction"],
-                                "description": f"Delete EKS cluster {name} and its node group (10-15 minutes)"}))
-    steps.append(cmd("aws", ["eks", "update-kubeconfig", "--name", name, "--region", region, "--kubeconfig", kubeconfig],
-                     "Write a kubeconfig for this cluster (in the task folder, not your default one)"))
-    if app:
-        apply_args = ["apply", "-f", str(app)] + (["-R"] if app.is_dir() else []) + ["--kubeconfig", kubeconfig]
-        delete_args = ["delete", "-f", str(app)] + (["-R"] if app.is_dir() else []) + \
-                      ["--kubeconfig", kubeconfig, "--ignore-not-found=true", "--wait=true"]
-        steps.append(cmd("kubectl", apply_args, f"Deploy the app to the cluster ({app.name})", timeout=900,
-                         undo_step={"kind": "command", "tool": "kubectl", "args": delete_args, "timeout": 900,
-                                    "pause_after": 60,
-                                    "description": "Delete the app (and its load balancer) from the cluster"}))
-        steps.append(cmd("kubectl", ["get", "deployments,services,pods", "--kubeconfig", kubeconfig, "-o", "wide"],
-                         "Show what is running"))
-    if v["app_source"] == "dockerfile":
-        steps.append(check("k8s_url", {"kubeconfig": kubeconfig, "service": name, "path": "/"},
-                           "Wait for the load balancer and check the app answers", timeout=1200))
-    app_label = docker_context(v["app_folder"])[0].name if v["app_source"] == "dockerfile" else \
-        Path(v.get("app_folder", "")).name
-    return ScriptDraft(title=f"Create EKS cluster {name}" + (f" and deploy {app_label}" if app else ""),
-                       steps=steps, notes=notes)
-
-
-EKS = Template(
-    name="eks_cluster",
-    description="EKS Kubernetes cluster (eksctl, managed nodes) and optionally deploy an app (Dockerfile or YAML)",
-    fields=[
-        FieldSpec("cost_ok", "EKS costs about $0.25/hour or more (~$5 per day). Continue?", "choice", must_ask=True,
-                  options=lambda e, i: [{"value": "yes", "label": "Yes, I understand and will tear it down after testing"}],
-                  validate=_validate_cost_ok,
-                  why="The control plane alone is billed per hour, even when idle."),
-        FieldSpec("name", "Cluster name?", "text", default="kintsugi-eks",
-                  validate=_name_validator(r"[a-z][a-z0-9-]{1,30}", "lowercase letters, numbers and - (max 31)")),
-        FieldSpec("app_source", "What should run on the cluster?", "choice", must_ask=True,
-                  options=lambda e, i: APP_SOURCES, validate=lambda e, i, v: _choice(APP_SOURCES, v, "app source")),
-        FieldSpec("app_folder", "Which Dockerfile / folder?", "path", must_ask=True, validate=_validate_app_folder,
-                  relevant=lambda i: i.get("app_source") in ("dockerfile", "manifests")),
-        FieldSpec("container_port", "Which port does the app listen on inside the container?", "number",
-                  must_ask=True, default=_docker_port_default, validate=lambda e, i, v: _int(v, 1, 65535, "port"),
-                  relevant=lambda i: i.get("app_source") == "dockerfile"),
-        FieldSpec("network", "Which network?", "choice", must_ask=True, default="new",
-                  options=lambda e, i: [{"value": "new", "label": "New VPC created by eksctl (no NAT gateway; recommended)"},
-                                        {"value": "existing", "label": "Existing public subnets (pick 2+ zones)"}],
-                  validate=lambda e, i, v: _choice([{"value": "new", "label": "new"},
-                                                    {"value": "existing", "label": "existing"}], v, "network")),
-        FieldSpec("subnets", "Which public subnets (2 or more availability zones)?", "multichoice", must_ask=True,
-                  options=_public_subnet_options, validate=_validate_public_subnets(2),
-                  relevant=lambda i: i.get("network") == "existing"),
-        FieldSpec("node_type", "Node size?", "choice", must_ask=True, default="t3.medium",
-                  options=lambda e, i: [{"value": t, "label": f"{t} (~${EC2_HOURLY[t]}/hour each)"} for t in NODE_TYPES],
-                  validate=lambda e, i, v: _choice([{"value": t, "label": t} for t in NODE_TYPES], v, "node size")),
-        FieldSpec("nodes", "How many nodes?", "number", default=2, validate=lambda e, i, v: _int(v, 1, 3, "nodes")),
-    ],
-    title=lambda i: f"EKS cluster '{i.get('name', 'kintsugi-eks')}'",
-    build=_build_eks, notes=_eks_notes,
 )
 
 
@@ -1470,6 +1063,17 @@ def _s3_notes(inputs) -> list[str]:
             "Secret-looking files (.env, *.pem, keys, Terraform state) and .git / node_modules are never uploaded."]
 
 
+UPLOAD_CLASSES = [
+    {"value": "STANDARD", "label": "Standard (frequent access, ~$0.023/GB-month)"},
+    {"value": "INTELLIGENT_TIERING", "label": "Intelligent-Tiering (AWS moves it automatically)"},
+    {"value": "STANDARD_IA", "label": "Standard-IA (infrequent access, ~$0.0125/GB-month)"},
+    {"value": "ONEZONE_IA", "label": "One Zone-IA (~$0.01/GB-month, one zone only)"},
+    {"value": "GLACIER_IR", "label": "Glacier Instant Retrieval (archive, ms access, ~$0.004/GB-month)"},
+    {"value": "GLACIER", "label": "Glacier Flexible Retrieval (archive, restore in minutes-hours, ~$0.0036)"},
+    {"value": "DEEP_ARCHIVE", "label": "Glacier Deep Archive (cheapest ~$0.001, restore in 12-48 hours)"},
+]
+
+
 def _build_s3_upload(env, v) -> ScriptDraft:
     source = Path(v["source"])
     steps: list[dict] = []
@@ -1496,8 +1100,12 @@ def _build_s3_upload(env, v) -> ScriptDraft:
     if v["bucket"] != "new":
         existing = _existing_keys(env, bucket, region, keys)
     new_keys = [k for k in keys if k not in existing]
+    sc = v.get("storage_class", "STANDARD")
     up = {"kind": "s3_upload", "source": str(source), "bucket": bucket, "prefix": v.get("prefix", ""),
-          "region": region, "description": f"Upload {len(files)} file(s) to s3://{bucket}/{v.get('prefix', '')}"}
+          "region": region, "description": f"Upload {len(files)} file(s) to s3://{bucket}/{v.get('prefix', '')}"
+                                           + (f" as {sc}" if sc != "STANDARD" else "")}
+    if sc != "STANDARD":
+        up["storage_class"] = sc
     if new_keys:
         up["undo"] = undo("s3", "delete_objects", {"Bucket": bucket, "Delete": {
             "Objects": [{"Key": k} for k in new_keys[:1000]], "Quiet": True}},
@@ -1526,6 +1134,10 @@ S3_UPLOAD = Template(
                   validate=_validate_new_bucket, relevant=lambda i: i.get("bucket") == "new"),
         FieldSpec("prefix", "Folder (prefix) inside the bucket? Leave empty for the top level.", "text",
                   default="", validate=_validate_prefix, allow_empty=True, why="Example: documents/2026/"),
+        FieldSpec("storage_class", "Storage class?", "choice", default="STANDARD",
+                  options=lambda e, i: UPLOAD_CLASSES,
+                  validate=lambda e, i, v: _choice(UPLOAD_CLASSES, str(v).upper().replace(" ", "_"), "storage class"),
+                  why="Archive classes (Glacier, Deep Archive) are much cheaper but must be restored before reading."),
     ],
     title=lambda i: "Upload to S3",
     build=_build_s3_upload, notes=_s3_notes,
@@ -2936,6 +2548,6 @@ DATABASE = Template(
 )
 
 
-RECIPES = [IAM_ROLE, LAMBDA, DOCKER_IMAGE, ECS_FARGATE, EKS, JENKINS, ANSIBLE_SITE, ANSIBLE_PLAYBOOK, TERRAFORM,
-           S3_UPLOAD, S3_WEBSITE, DATABASE]
+RECIPES = [IAM_ROLE, DOCKER_IMAGE, JENKINS, ANSIBLE_SITE, ANSIBLE_PLAYBOOK, TERRAFORM, S3_UPLOAD, S3_WEBSITE,
+           DATABASE]
 templates.TEMPLATES.update({t.name: t for t in RECIPES})

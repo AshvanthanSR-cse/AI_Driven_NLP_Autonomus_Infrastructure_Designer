@@ -44,7 +44,7 @@ def extract_function(text: str) -> str | None:
 _PATH_RE = re.compile(r"""["']([A-Za-z]:\\[^"']+)["']|([A-Za-z]:\\[^\s"',]+)""")
 PATH_FIELD = {"lambda_function": "source_folder", "docker_image": "app_folder", "ecs_fargate_service": "app_folder",
               "eks_cluster": "app_folder", "ansible_website": "folder", "ansible_playbook": "folder",
-              "terraform_project": "folder", "s3_upload": "source",
+              "terraform_project": "folder", "s3_upload": "source", "glacier_vault": "file",
               "s3_static_website": "source"}
 _BUCKET_RE = re.compile(r"\b(?:bucket|s3://)\s*(?:named\s+|called\s+)?['\"]?([a-z0-9][a-z0-9.-]{1,61}[a-z0-9])", re.I)
 _BUCKET_STOP = {"named", "called", "the", "my", "a", "an", "in", "to", "and"}
@@ -77,15 +77,47 @@ def _recipe_for(t: str) -> str | None:
                                          "index.html", "public access", "public bucket")
                                     or _has_word(t, "host", "hosting", "public")):
         return "s3_static_website"
+    if _has(t, "cloudfront", "cdn", "distribution", "invalidat"):
+        return "cloudfront_distribution"
+    if _has(t, "glacier vault", "vault") and not _has(t, "secret"):
+        return "glacier_vault"
+    if _has(t, "s3", "bucket") and _has(t, "lifecycle", "versioning", "replicat", "object lock", "cors",
+                                         "encryption", "inventory", "event notification", "after 30 days",
+                                         "after 60 days", "after 90 days", "after 180 days", "after 365 days"):
+        return "s3_bucket"
+    if _has(t, "restore") and _has(t, "glacier", "archive", "deep archive") or \
+            _has(t, "s3", "bucket", "objects", "files") and _has(t, "storage class", "to glacier", "to deep archive",
+                                                                   "archive them", "archive the"):
+        return "s3_objects"
     if _has(t, "s3", "bucket") and _has_word(t, "upload", "put", "store", "copy", "save", "send", "move", "add"):
         return "s3_upload"
+    if _has(t, "s3 bucket", "bucket") and _has_word(t, "create", "make", "new"):
+        return "s3_bucket"
     if _has(t, "database", "rds", "dynamodb", "dynamo db", "aurora", "postgres", "mysql", "mariadb", "documentdb",
             "docdb", "mongodb", "redis", "valkey", "memcached", "elasticache", "db2", "oracle", "sql server", "sqlserver", "mssql")             or _has_word(t, "db"):
         return "database"
-    if _has(t, "eks", "kubernetes", "k8s"):
+    if _has(t, "eks", "kubernetes", "k8s", "helm"):
+        if _has(t, "node group", "nodegroup", "scale", "add-on", "addon", "upgrade", "existing cluster",
+                "my cluster", "to the cluster", "on the cluster", "helm") and not _has_word(t, "new"):
+            return "eks_manage"
         return "eks_cluster"
     if _has(t, "fargate", "ecs"):
         return "ecs_fargate_service"
+    if _has(t, "auto scaling", "autoscaling", "auto-scaling", "asg", "scaling group", "scaling policy",
+            "instance refresh"):
+        return "auto_scaling_group"
+    if _has(t, "launch template"):
+        return "launch_template"
+    if _has(t, "target group"):
+        return "target_group"
+    if _has(t, "load balancer", "loadbalancer", "alb", "nlb", "elb"):
+        return "load_balancer"
+    if _has(t, "ami", "machine image", "golden image"):
+        return "ami"
+    if _has(t, "ebs", "volume", "snapshot"):
+        return "ebs_volume"
+    if _has(t, "ecr", "repository", "registry") and not _has(t, "dockerfile", "docker image", "push"):
+        return "ecr_repository"
     if _has(t, "jenkins"):
         return "jenkins_server"
     if _has(t, "terraform", ".tf "):
@@ -99,7 +131,15 @@ def _recipe_for(t: str) -> str | None:
     if _has(t, "iam role", "role for", "execution role"):
         return "iam_role"
     if _has(t, "lambda", "function"):
+        if _has(t, "alias", "version", "concurrency", "trigger", "memory", "timeout", "env var", "environment",
+                "layer", "existing function", "delete") and not extract_path(t):
+            return "lambda_manage"
         return "lambda_function"
+    if _has(t, "security group", "firewall", "network acl", "nacl", "peering", "vpc endpoint", "endpoint",
+            "flow log", "transit gateway", "elastic ip", "eip", "vpn", "prefix list", "dhcp", "egress-only") or \
+            _has(t, "subnet", "route", "nat gateway", "internet gateway") and _has(t, "existing", "my vpc", "to the vpc",
+                                                                                   "in vpc", "add a", "add an"):
+        return "vpc_resource"
     if _has(t, "vpc", "subnet", "nat gateway", "internet gateway", "route table", "routing table"):
         return "vpc_network"
     if _has(t, "instance", "ec2", "server", "vm", "machine"):
@@ -172,7 +212,9 @@ def route(text: str, attachments: list[dict] | None = None) -> tuple[str, dict] 
             return "check_prerequisites", {"service": word}
 
     builds = _has_word(t, "create", "launch", "build", "provision", "make", "spin up", "set up", "setup", "deploy",
-                       "need", "host", "install", "push", "apply", "upload")
+                       "need", "host", "install", "push", "apply", "upload", "add", "attach", "detach", "resize",
+                       "scale", "share", "copy", "restore", "archive", "invalidate", "configure", "enable", "delete",
+                       "remove", "release", "publish", "allocate", "snapshot", "upgrade", "change", "update", "move")
     uploads = _has_word(t, "upload", "put", "store", "copy", "save", "send", "move")
     if not _is_question(t) and (builds or uploads or attachments or
                                 _has(t, "terraform", "ansible", "playbook", "dockerfile")):
@@ -194,7 +236,7 @@ def route(text: str, attachments: list[dict] | None = None) -> tuple[str, dict] 
             return "plan_task", {"template": recipe, "inputs": inputs}
 
     is_lambda = _has(t, "lambda", "function")
-    if _has(t, "alb", "load balancer", "loadbalancer", "elb", "nlb"):
+    if _has(t, "alb", "load balancer", "loadbalancer", "elb", "nlb") and not _has(t, "target group"):
         return "list_load_balancers", {}
     if is_lambda and _has(t, "extract", "download", "code", "script", "source"):
         fn = extract_function(text)

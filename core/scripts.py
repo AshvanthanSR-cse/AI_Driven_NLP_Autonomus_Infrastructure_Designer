@@ -83,6 +83,8 @@ def makes_public(step: dict) -> bool:
                                                      "RestrictPublicBuckets"))
     if svc == "s3" and op == "put_bucket_policy":
         return bool(_public_statements(params.get("Policy")))
+    if svc == "lambda" and op == "add_permission" and params.get("Principal") == "*":
+        return True
     return False
 
 
@@ -140,7 +142,21 @@ def check_write_allowed(service: str, operation: str, params: dict) -> None:
         _check_iam(operation, params)
     if service == "s3" and operation == "put_bucket_policy" and not has_placeholders(params):
         _check_public_bucket_policy(params)
+    if service == "ec2" and operation in ("modify_image_attribute", "modify_snapshot_attribute"):
+        _check_not_public_image(params)
     _check_no_plain_password(service, operation, params)
+
+
+def _check_not_public_image(params: dict) -> None:
+    """AMIs and snapshots may be shared with specific accounts, never made public (they can contain data)."""
+    perm = params.get("LaunchPermission") or {}
+    groups = [p.get("Group") for p in perm.get("Add", []) if isinstance(p, dict)]
+    groups += [params.get("Attribute") == "createVolumePermission" and params.get("OperationType") == "add"
+               and g for g in params.get("GroupNames", [])]
+    groups += [p.get("Group") for p in (params.get("CreateVolumePermission") or {}).get("Add", []) if isinstance(p, dict)]
+    if "all" in groups:
+        raise ScriptError("Making an AMI or snapshot public is blocked: anyone could copy your disk. Share it with "
+                          "specific account IDs instead.")
 
 
 def _check_no_plain_password(service: str, operation: str, params) -> None:

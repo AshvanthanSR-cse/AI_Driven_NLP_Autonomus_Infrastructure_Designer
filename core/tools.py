@@ -22,6 +22,8 @@ from core.aws_conn import AwsConnection
 from core.config import PROJECT_ROOT, settings
 from core.scripts import ScriptDraft, ScriptError
 
+templates.load_catalog()
+
 
 @dataclass
 class ToolContext:
@@ -658,18 +660,47 @@ register(Tool(
 
 
 TEMPLATE_HELP = {
-    "vpc_network": "VPC with public/private subnets, internet gateway, route tables, optional NAT",
+    "vpc_network": "new VPC: public/private subnets, internet gateway, route tables, NAT (one or per zone), IPv6, "
+                   "flow logs, S3 endpoint",
+    "vpc_resource": "one VPC part in an existing VPC: subnet, security group or its rules, network ACL, route table, "
+                    "route, internet/NAT/egress-only gateway, Elastic IP, peering, endpoint, flow logs, transit gateway, "
+                    "IPv6/secondary CIDR, DHCP options, site-to-site VPN, prefix list, or delete one",
     "ec2_instance": "launch one EC2 instance",
     "iam_role": "IAM role for a service with managed policies",
-    "lambda_function": "create or update a Lambda function from a local code folder, optional schedule",
+    "lambda_function": "create or update a Lambda function from a local folder or Dockerfile; trigger: schedule, S3, "
+                       "SQS, DynamoDB stream, SNS, HTTP API or function URL; env vars, layers, VPC, alias",
+    "lambda_manage": "existing Lambda function: settings, add a trigger, publish version + alias (canary), "
+                     "concurrency, delete",
     "docker_image": "docker build a local Dockerfile folder and push it to ECR",
-    "ecs_fargate_service": "run a local Dockerfile app on ECS Fargate (ECR + cluster + service + public IP)",
-    "eks_cluster": "EKS Kubernetes cluster with eksctl, optionally deploy a Dockerfile app or YAML manifests",
+    "ecr_repository": "ECR repository create/configure (immutable tags, scanning, lifecycle cleanup, cross-account), "
+                      "replication, pull-through cache, registry scanning, delete",
+    "ecs_fargate_service": "ECS app from a Dockerfile or image on Fargate / Fargate Spot / EC2; public IP, new ALB or "
+                           "private; task auto scaling; env vars + secrets; service, scheduled or one-off task",
+    "eks_cluster": "new EKS cluster (managed/Spot nodes, Auto Mode or Fargate, add-ons) + optional app: Dockerfile, "
+                   "YAML manifests or Helm chart",
+    "eks_manage": "existing EKS cluster: deploy app/manifests/Helm chart, scale or add node groups, add-on, upgrade, "
+                  "logging, delete",
+    "load_balancer": "Application or Network Load Balancer + target group + HTTP/HTTPS listeners + targets "
+                     "(instances, IPs, Lambda) + path/host rules",
+    "target_group": "target group with health checks and targets, optionally routed from an existing ALB listener",
+    "launch_template": "EC2 launch template or new version (AMI/OS, size, key, security group, user data, disk, role)",
+    "auto_scaling_group": "Auto Scaling group (+ launch template, + optional new ALB): target tracking, step, "
+                          "predictive or scheduled scaling, Spot/mixed; or update / instance refresh / delete",
+    "ami": "AMI: create from an instance, copy to a region, share/unshare, deprecate, deregister",
+    "ebs_volume": "EBS: create/attach/detach/resize volumes, snapshots (copy, archive, restore), daily snapshot "
+                  "schedule, default encryption, delete",
     "jenkins_server": "Jenkins CI server on EC2",
     "ansible_website": "deploy a local website folder (static or Flask) to a running instance with Ansible + nginx",
     "ansible_playbook": "run the user's own Ansible playbook folder on running instances",
     "terraform_project": "terraform plan/apply/destroy of the user's own .tf folder",
-    "s3_upload": "upload a local file or folder (document, images, backup) to a PRIVATE S3 bucket",
+    "s3_upload": "upload a local file or folder to a PRIVATE S3 bucket, any storage class (Glacier, Deep Archive)",
+    "s3_bucket": "private S3 bucket create/configure: versioning, encryption, object lock, lifecycle to "
+                 "Standard-IA/Glacier/Deep Archive/expiry, CORS, events, logging, replication, inventory",
+    "s3_objects": "bulk S3 objects under a prefix: change storage class (to Glacier ...), restore from Glacier, copy, "
+                  "move, delete",
+    "glacier_vault": "S3 Glacier vaults: create, upload archive, inventory/retrieval jobs, delete",
+    "cloudfront_distribution": "CloudFront CDN for a private S3 bucket, S3 website, load balancer or domain; "
+                               "invalidate cache; delete",
     "s3_static_website": "host a static website (index.html or site folder) in a PUBLIC S3 bucket: website "
                          "hosting, Block Public Access off, public-read policy, optional versioning",
     "database": "create a database: RDS PostgreSQL/MySQL/MariaDB/SQL Server (Express/Web/Standard/Enterprise)/"
@@ -680,22 +711,34 @@ TEMPLATE_HELP = {
 }
 
 
+def _main_keys(t) -> list[str]:
+    """The keys the user is most likely to name: fields before the 'settings' switch (max 12)."""
+    keys = []
+    for f in t.fields:
+        if f.key == "settings":
+            keys.append("settings")
+            break
+        keys.append(f.key)
+    return keys[:12]
+
+
 def _input_keys_help() -> str:
-    return " ".join(f"{name}: {', '.join(f.key for f in t.fields)}." for name, t in templates.TEMPLATES.items())
+    return " ".join(f"{name}: {', '.join(_main_keys(t))}." for name, t in templates.TEMPLATES.items())
 
 
 class PlanTaskArgs(BaseModel):
     template: Literal[tuple(TEMPLATE_HELP)] = Field(
         description=" | ".join(f"{k}: {v}" for k, v in TEMPLATE_HELP.items()))
     inputs: dict = Field(default_factory=dict, description=(
-        "ONLY details the user actually said (e.g. a folder path, a name). Keys per template: "
-        + _input_keys_help() + " Leave out anything the user did not say; the app asks for the rest."))
+        "ONLY details the user actually said (e.g. a folder path, a name). Main keys per template: "
+        + _input_keys_help() + " Advanced options also exist (pass settings='custom' when the user names one). "
+        "Leave out anything the user did not say; the app asks for the rest."))
 
 
 PATH_FIELDS = {"lambda_function": "source_folder", "docker_image": "app_folder", "ecs_fargate_service": "app_folder",
-               "eks_cluster": "app_folder", "ansible_website": "folder", "ansible_playbook": "folder",
-               "terraform_project": "folder", "s3_upload": "source",
-               "s3_static_website": "source"}
+               "eks_cluster": "app_folder", "eks_manage": "app_folder", "ansible_website": "folder",
+               "ansible_playbook": "folder", "terraform_project": "folder", "s3_upload": "source",
+               "s3_static_website": "source", "glacier_vault": "file"}
 
 
 def describe_attachment(path: str) -> dict:
@@ -717,7 +760,8 @@ def _attachment_for(template: str, attachments: list[dict]) -> str | None:
     if not attachments:
         return None
     want = {"docker_image": ("dockerfile", "docker"), "ecs_fargate_service": ("dockerfile", "docker"),
-            "eks_cluster": ("dockerfile", "docker", "yaml", "yml"), "terraform_project": ("terraform",),
+            "eks_cluster": ("dockerfile", "docker", "yaml", "yml"),
+            "eks_manage": ("dockerfile", "docker", "yaml", "yml"), "terraform_project": ("terraform",),
             "lambda_function": ("python", "node"), "ansible_website": ("static", "python", "node"),
             "s3_static_website": ("html", "htm", "static")}.get(template)
     if want:
@@ -755,11 +799,11 @@ def plan_task(ctx: ToolContext, args: PlanTaskArgs):
 
 register(Tool(
     name="plan_task",
-    description=("Build or deploy something in several steps: VPC network, EC2 instance, IAM role, Lambda from a "
-                 "local folder, Docker image to ECR, app on ECS Fargate, EKS cluster (+ app), Jenkins server, "
-                 "website deploy with Ansible, public static website on S3, your own Ansible playbook, your own Terraform folder, a database "
-                 "(RDS, Aurora, DynamoDB, DocumentDB, Redis). The app asks "
-                 "the user for anything missing, then saves a script on the Scripts page."),
+    description=("Build, deploy or change AWS infrastructure in several steps (pick the template): VPC and every "
+                 "VPC part, EC2, launch templates, Auto Scaling, load balancers / target groups, AMIs, EBS, Lambda, "
+                 "ECR, ECS, EKS, S3 (buckets, lifecycle, Glacier, objects), Glacier vaults, CloudFront, IAM roles, "
+                 "databases, Jenkins, Ansible, Terraform. The app asks the user for anything missing, then saves a "
+                 "script on the Scripts page."),
     args_model=PlanTaskArgs, risk="operate", func=plan_task,
 ))
 

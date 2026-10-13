@@ -196,7 +196,7 @@ class QuestionCard(QGroupBox):
             return PathPicker(q["kind"], "" if default is None else str(default))
         if q["kind"] == "number":
             w = QSpinBox()
-            w.setRange(0, 1_000_000)
+            w.setRange(0, 2_000_000_000)
             w.setValue(int(default) if str(default).isdigit() else 0)
             return w
         return QLineEdit("" if default is None else str(default))

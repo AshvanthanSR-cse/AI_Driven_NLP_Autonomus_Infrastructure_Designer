@@ -9,6 +9,12 @@ Step kinds (field "kind"; a step without it is a boto3 call handled in core/scri
   s3_upload {"source": "<local file or folder>", "bucket": "...", "prefix": "docs/", "flatten": false}
             (SSE-S3 encrypted; flatten=true puts a folder's contents at the prefix, e.g. index.html at the root)
   s3_empty  {"bucket": "..."}  (deletes every object version; only buckets tagged CreatedBy=kintsugi)
+  s3_objects {"bucket", "prefix", "action": "storage_class|restore|delete|copy|move", "storage_class",
+              "days", "tier", "dest_bucket", "dest_prefix"}  (bulk object actions, e.g. Glacier restore)
+  cf_delete {"distribution_id": "..."}  (disable, wait until deployed, delete; only Kintsugi-tagged ones)
+  ami_delete {"image_id": "ami-..."}  (deregister the AMI and delete its EBS snapshots; own AMIs only)
+  wait_until {"service", "operation": "describe_...", "params", "path": "A.0.State", "equals": [...]}
+             (polls a READ call until a value is reached, for resources without an AWS waiter)
   cloud     {"provider": "azure|gcp", "action": "vm_start|vm_stop|upload", "params": {...}}  (core/clouds.py)
 
 Safety: only allowlisted tools and sub-commands; no shell (argument lists only); AWS credentials of the
@@ -29,14 +35,24 @@ from pathlib import Path
 
 from core import workspace
 
-KINDS = ("command", "ecr_login", "ansible", "check", "s3_upload", "s3_empty", "cloud")
+KINDS = ("command", "ecr_login", "ansible", "check", "s3_upload", "s3_empty", "s3_objects", "cf_delete",
+         "ami_delete", "wait_until", "cloud")
 COMMON_KEYS = {"kind", "description", "region", "save_as", "undo", "pause_after", "timeout"}
 KIND_KEYS = {"command": {"tool", "args", "cwd"}, "ecr_login": {"repository_uri"},
              "ansible": {"workdir", "playbook", "inventory", "ssh_key_path", "extra_args"},
-             "check": {"check", "params"}, "s3_upload": {"source", "bucket", "prefix", "flatten"},
+             "check": {"check", "params"}, "s3_upload": {"source", "bucket", "prefix", "flatten", "storage_class"},
              "s3_empty": {"bucket"},
+             "s3_objects": {"bucket", "prefix", "action", "storage_class", "days", "tier", "dest_bucket",
+                            "dest_prefix"},
+             "cf_delete": {"distribution_id"}, "ami_delete": {"image_id"},
+             "wait_until": {"service", "operation", "params", "path", "equals"},
              "cloud": {"provider", "action", "params"}}
 CLOUD_ACTIONS = ("vm_start", "vm_stop", "upload")
+STORAGE_CLASSES = ("STANDARD", "STANDARD_IA", "ONEZONE_IA", "INTELLIGENT_TIERING", "GLACIER_IR", "GLACIER",
+                   "DEEP_ARCHIVE")
+ARCHIVE_CLASSES = ("GLACIER", "DEEP_ARCHIVE")
+S3_OBJECT_ACTIONS = ("storage_class", "restore", "delete", "copy", "move")
+RESTORE_TIERS = ("Expedited", "Standard", "Bulk")
 S3_MAX_MB = 5000
 CHECKS = ("http", "ec2_url", "ecs_url", "k8s_url")
 MAX_TIMEOUT_S = 90 * 60
@@ -107,7 +123,8 @@ def validate(step: dict) -> None:
         raise StepError(f"timeout must be 0..{MAX_TIMEOUT_S} seconds")
     {"command": _validate_command, "ecr_login": _validate_ecr_login, "ansible": _validate_ansible,
      "check": _validate_check, "s3_upload": _validate_s3_upload, "s3_empty": _validate_s3_empty,
-     "cloud": _validate_cloud}[kind](step)
+     "s3_objects": _validate_s3_objects, "cf_delete": _validate_cf_delete, "ami_delete": _validate_ami_delete,
+     "wait_until": _validate_wait_until, "cloud": _validate_cloud}[kind](step)
 
 
 _BUCKET_RE = re.compile(r"[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]")
@@ -132,6 +149,62 @@ def _validate_s3_upload(step: dict) -> None:
         raise StepError("'flatten' must be true or false")
     if src and Path(src).is_file() and workspace._excluded_file(Path(src).name):
         raise StepError(f"{Path(src).name} looks like a secret file (key, .env, state); it is never uploaded")
+    if step.get("storage_class", "STANDARD") not in STORAGE_CLASSES:
+        raise StepError(f"storage_class must be one of {', '.join(STORAGE_CLASSES)}")
+
+
+def _bucket_ok(b: str, what: str = "bucket") -> None:
+    if "{{" not in (b or "") and not _BUCKET_RE.fullmatch(b or ""):
+        raise StepError(f"'{b}' is not a valid S3 {what} name")
+
+
+def _validate_s3_objects(step: dict) -> None:
+    _bucket_ok(step.get("bucket", ""))
+    check_prefix(step.get("prefix", ""))
+    action = step.get("action")
+    if action not in S3_OBJECT_ACTIONS:
+        raise StepError(f"action must be one of {', '.join(S3_OBJECT_ACTIONS)}")
+    if action in ("storage_class", "copy", "move") and step.get("storage_class", "STANDARD") not in STORAGE_CLASSES:
+        raise StepError(f"storage_class must be one of {', '.join(STORAGE_CLASSES)}")
+    if action == "restore":
+        if step.get("tier", "Standard") not in RESTORE_TIERS:
+            raise StepError(f"tier must be one of {', '.join(RESTORE_TIERS)}")
+        d = step.get("days", 1)
+        if not isinstance(d, int) or not 1 <= d <= 365:
+            raise StepError("days (how long the restored copy stays available) must be 1..365")
+    if action in ("copy", "move"):
+        _bucket_ok(step.get("dest_bucket", ""), "destination bucket")
+        check_prefix(step.get("dest_prefix", ""))
+        if step.get("dest_bucket") == step.get("bucket") and \
+                check_prefix(step.get("dest_prefix", "")) == check_prefix(step.get("prefix", "")):
+            raise StepError("copy/move needs a different destination bucket or prefix")
+
+
+def _validate_cf_delete(step: dict) -> None:
+    d = str(step.get("distribution_id", ""))
+    if "{{" not in d and not re.fullmatch(r"E[A-Z0-9]{5,20}", d):
+        raise StepError(f"'{d}' is not a CloudFront distribution ID")
+
+
+def _validate_wait_until(step: dict) -> None:
+    if not re.fullmatch(r"[a-z0-9-]+", str(step.get("service", ""))):
+        raise StepError("wait_until needs a boto3 service name")
+    if not re.fullmatch(r"(describe|get|list)_[a-z0-9_]+", str(step.get("operation", ""))):
+        raise StepError("wait_until may only poll a read operation (describe_/get_/list_)")
+    if not re.fullmatch(r"[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*", str(step.get("path", ""))):
+        raise StepError("wait_until 'path' looks like Things.0.State")
+    eq = step.get("equals")
+    if not isinstance(eq, list) or not eq or not all(isinstance(x, str) for x in eq):
+        raise StepError("wait_until 'equals' must be a list of values")
+    if not isinstance(step.get("params", {}), dict):
+        raise StepError("wait_until 'params' must be an object")
+
+
+def _validate_ami_delete(step: dict) -> None:
+    i = str(step.get("image_id", ""))
+    if "{{" not in i and not re.fullmatch(r"ami-[0-9a-f]{8,17}", i):
+        raise StepError(f"'{i}' is not an AMI ID")
+
 
 
 def _validate_s3_empty(step: dict) -> None:
@@ -249,8 +322,10 @@ def _validate_check(step: dict) -> None:
 
 
 def is_destructive(step: dict) -> bool:
-    if kind_of(step) == "s3_empty":
+    if kind_of(step) in ("s3_empty", "cf_delete", "ami_delete"):
         return True
+    if kind_of(step) == "s3_objects":
+        return step.get("action") in ("delete", "move")
     return kind_of(step) == "command" and _subcommand(step) in DESTRUCTIVE_SUBCOMMANDS.get(step.get("tool"), set())
 
 
@@ -304,11 +379,39 @@ def _render_more(step: dict, region: str) -> str | None:
         rec = " --recursive" if is_dir else ""
         if is_dir and not step.get("flatten"):
             dest += Path(src).name + "/"
-        return (f'aws s3 cp "{src}" {dest}{rec} --sse AES256 --region {step.get("region") or region}'
+        sc = f" --storage-class {step['storage_class']}" if step.get("storage_class", "STANDARD") != "STANDARD" else ""
+        return (f'aws s3 cp "{src}" {dest}{rec} --sse AES256{sc} --region {step.get("region") or region}'
                 f"   # secret files (.env, keys) are skipped")
     if kind == "s3_empty":
         return (f"aws s3api delete-objects --bucket {step['bucket']} ...   "
                 f"# every object version and delete marker (needed before a versioned bucket can be deleted)")
+    if kind == "s3_objects":
+        src = f"s3://{step['bucket']}/{check_prefix(step.get('prefix', ''))}"
+        a = step["action"]
+        if a == "storage_class":
+            return (f"aws s3 cp {src} {src} --recursive --storage-class {step.get('storage_class', 'STANDARD')} "
+                    f"--metadata-directive COPY   # objects still in Glacier must be restored first (skipped)")
+        if a == "restore":
+            return (f"aws s3api restore-object --bucket {step['bucket']} --key <each archived object under "
+                    f"{step.get('prefix') or '/'}> --restore-request Days={step.get('days', 1)},"
+                    f"GlacierJobParameters={{Tier={step.get('tier', 'Standard')}}}")
+        if a == "delete":
+            return f"aws s3 rm {src} --recursive   # deletes the current versions under this prefix"
+        dest = f"s3://{step['dest_bucket']}/{check_prefix(step.get('dest_prefix', ''))}"
+        verb = "mv" if a == "move" else "cp"
+        return (f"aws s3 {verb} {src} {dest} --recursive --storage-class {step.get('storage_class', 'STANDARD')}"
+                f" --sse AES256")
+    if kind == "cf_delete":
+        d = step["distribution_id"]
+        return (f"aws cloudfront update-distribution --id {d} ... Enabled=false   # then\n"
+                f"aws cloudfront wait distribution-deployed --id {d}\n"
+                f"aws cloudfront delete-distribution --id {d} --if-match <current ETag>")
+    if kind == "wait_until":
+        return (f"aws {step['service']} {step['operation'].replace('_', '-')} ...   # repeat until "
+                f"{step['path']} is {' or '.join(step['equals'])}")
+    if kind == "ami_delete":
+        return (f"aws ec2 deregister-image --image-id {step['image_id']}\n"
+                f"aws ec2 delete-snapshot --snapshot-id <each snapshot of {step['image_id']}>")
     if kind == "cloud":
         p = step.get("params", {})
         if step["action"] == "upload":
@@ -431,6 +534,9 @@ def run(step: dict, conn, purpose: str, region: str, progress=None) -> dict:
         return _run_s3_upload(step, conn, purpose, region, progress)
     if kind == "s3_empty":
         return _run_s3_empty(step, conn, purpose, region, progress)
+    if kind in ("s3_objects", "cf_delete", "ami_delete", "wait_until"):
+        from core import aws_steps
+        return aws_steps.run(step, conn, purpose, region, progress)
     if kind == "cloud":
         return _run_cloud(step, conn, purpose, progress)
     return _run_check(step, conn, purpose, region, progress)
@@ -462,6 +568,8 @@ def _run_s3_upload(step, conn, purpose, region, progress):
     total = 0
     for n, (path, key, size) in enumerate(files, 1):
         extra = {"ServerSideEncryption": "AES256"}
+        if step.get("storage_class", "STANDARD") != "STANDARD":
+            extra["StorageClass"] = step["storage_class"]
         if ctype := mimetypes.guess_type(path.name)[0]:
             extra["ContentType"] = ctype
         s3.upload_file(str(path), step["bucket"], key, ExtraArgs=extra)

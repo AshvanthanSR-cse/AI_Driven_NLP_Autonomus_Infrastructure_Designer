@@ -128,6 +128,20 @@ def subnets_item(env, min_azs: int = 2, public: bool = False, required: bool = T
     return PrereqItem("subnets", title, "ready" if found else "missing", why, VPC_HOW, found, required)
 
 
+def vpc_item(env, required: bool = True) -> PrereqItem:
+    title, why = "A VPC", "The resource is added to an existing VPC."
+    subs, err = _lookup(env.subnets)
+    if err:
+        return _unknown("vpc", title, why, VPC_HOW, err, required)
+    found = list(dict.fromkeys(s["vpc_name"] or s["vpc"] for s in subs))
+    if not found:
+        try:
+            found = [v["VpcId"] for v in env.ec2().describe_vpcs().get("Vpcs", [])]
+        except Exception:
+            found = []
+    return PrereqItem("vpc", title, "ready" if found else "missing", why, VPC_HOW, found, required)
+
+
 def key_pair_item(env, required: bool = False) -> PrereqItem:
     title, why = "EC2 key pair (for SSH)", "Needed to log in with SSH."
     how = "EC2 console -> Key pairs -> Create key pair (download the .pem file and keep it safe)."
@@ -242,7 +256,34 @@ def _template_items(template: str, env, i: dict) -> list[PrereqItem] | None:
     if template == "terraform_project":
         return [tool_item("terraform", "Runs terraform plan/apply.")]
     if template == "lambda_function":
-        return [created("role", "Lambda execution role (or pick an existing one)")]
+        items = [created("role", "Lambda execution role (or pick an existing one)")]
+        if i.get("package") == "image":
+            items.insert(0, tool_item("docker", "The container image is built on this computer."))
+        return items
+    if template in ("load_balancer", "auto_scaling_group") or (template == "ecs_fargate_service"
+                                                               and i.get("exposure") == "alb"):
+        need = 2 if template != "auto_scaling_group" or i.get("load_balancing", "new_alb") == "new_alb" else 1
+        if template == "auto_scaling_group" and i.get("action", "create") != "create":
+            return None
+        return [subnets_item(env, need, public=i.get("scheme", "internet-facing") == "internet-facing",
+                             why="An internet-facing load balancer needs public subnets in 2 availability zones."),
+                created("sg", "Security groups (load balancer and instances)")]
+    if template == "launch_template":
+        return [key_pair_item(env, required=False), created("sg", "Security group (or pick an existing one)")]
+    if template == "vpc_resource" and i.get("resource") not in (None, "transit_gateway", "prefix_list"):
+        return [vpc_item(env)]
+    if template == "eks_manage":
+        items = [tool_item("kubectl", "Talks to the cluster."), tool_item("aws", "Writes the kubeconfig.")]
+        if i.get("action") in ("add_nodegroup", "delete"):
+            items.append(tool_item("eksctl", "Manages node groups and clusters."))
+        if i.get("app_source") == "dockerfile":
+            items.append(tool_item("docker", "The app image is built on this computer."))
+        if i.get("app_source") == "helm":
+            items.append(tool_item("helm", "Installs the chart."))
+        return items
+    if template == "cloudfront_distribution" and i.get("aliases"):
+        return [manual("dns", "A DNS record for your custom domain", "Visitors reach CloudFront through it.",
+                       "After the run, add a CNAME (or Route 53 alias) to the distribution domain.", required=False)]
     return None
 
 
@@ -259,8 +300,9 @@ SERVICE_TEMPLATES = {
     "rds": ("database", {}), "dynamodb": ("database", {"engine": "dynamodb"}),
     "docdb": ("database", {"engine": "docdb"}), "elasticache": ("database", {"engine": "redis"}),
     "ec2": ("ec2_instance", {}), "ecs": ("ecs_fargate_service", {}), "eks": ("eks_cluster", {}),
-    "lambda": ("lambda_function", {}), "ecr": ("docker_image", {}), "s3": ("s3_upload", {}),
-    "iam": ("iam_role", {}),
+    "lambda": ("lambda_function", {}), "ecr": ("ecr_repository", {}), "s3": ("s3_bucket", {}),
+    "iam": ("iam_role", {}), "elbv2": ("load_balancer", {}), "autoscaling": ("auto_scaling_group", {}),
+    "cloudfront": ("cloudfront_distribution", {}), "glacier": ("glacier_vault", {}),
 }
 SERVICE_WORDS = {
     "db2": "rds", "oracle": "rds", "sql server": "rds", "sqlserver": "rds", "mssql": "rds", "postgres": "rds",
@@ -282,7 +324,9 @@ SERVICE_WORDS = {
     "load balancer": "elbv2", "alb": "elbv2", "nlb": "elbv2", "ec2": "ec2", "instance": "ec2", "ecs": "ecs",
     "fargate": "ecs", "eks": "eks", "kubernetes": "eks", "lambda": "lambda", "s3": "s3", "bucket": "s3",
     "ecr": "ecr", "iam": "iam", "vpc": "ec2", "cloudformation": "cloudformation", "ses": "sesv2",
-    "acm": "acm", "certificate": "acm",
+    "acm": "acm", "certificate": "acm", "auto scaling": "autoscaling", "autoscaling": "autoscaling",
+    "launch template": "ec2", "target group": "elbv2", "ami": "ec2", "ebs": "ec2", "volume": "ec2",
+    "snapshot": "ec2", "glacier": "glacier", "cdn": "cloudfront", "security group": "ec2",
 }
 MAIN_CREATE = ["create_db_cluster", "create_cluster", "create_cluster_v2", "create_domain", "create_db_instance",
                "create_function", "create_table", "create_environment", "create_workgroup", "create_file_system",

@@ -299,3 +299,22 @@ class TestAwsErrorText(unittest.TestCase):
         e = ClientError({"Error": {"Code": "SignatureDoesNotMatch", "Message": "The secret key is wrong"}}, "X")
         self.assertEqual(templates.audit_error(e), "SignatureDoesNotMatch")
         self.assertEqual(templates.audit_error(ValueError("x")), "ValueError")
+
+
+class TestPlannerRelevance(unittest.TestCase):
+    def test_unanswered_choice_uses_its_default_for_later_questions(self):
+        from tests.test_infra_recipes import conn as infra_conn
+        q = templates.plan("s3_bucket", {}, infra_conn(), confirmed=set())
+        self.assertIn("name", [x.key for x in q.questions])
+
+    def test_advanced_value_switches_settings_to_custom(self):
+        from tests.test_infra_recipes import conn as infra_conn
+        q = templates.plan("ecs_fargate_service", {"image_source": "image", "image_uri": "nginx:1.27",
+                                                   "env_vars": "MODE=prod"}, infra_conn(), confirmed=set())
+        self.assertEqual(q.inputs["settings"], "custom")
+        self.assertEqual(q.inputs["env_vars"], "MODE=prod")
+
+    def test_optional_field_takes_default_silently(self):
+        q = templates.plan("vpc_network", {"name": "lab", "cidr": "10.0.0.0/16", "azs": ["us-east-1a", "us-east-1b"],
+                                           "nat_gateway": "no"}, conn())
+        self.assertNotIn("flow_logs", [x.key for x in getattr(q, "questions", [])])

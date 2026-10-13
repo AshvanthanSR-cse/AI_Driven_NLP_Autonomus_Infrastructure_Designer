@@ -69,6 +69,7 @@ class FieldSpec:
     allow_custom: bool = False
     empty_hint: str = ""
     allow_empty: bool = False
+    optional: bool = False
 
 
 @dataclass
@@ -324,24 +325,39 @@ def _az_default(env, inputs):
 
 NAT_OPTIONS = [
     {"value": "yes", "label": "Yes, one NAT gateway (about $0.05/hour, about $36/month; over a $5 budget in ~4 days)"},
+    {"value": "per_az", "label": "One NAT gateway per availability zone (highly available; multiplies the cost)"},
     {"value": "no", "label": "No NAT (private subnets get no internet access; free)"},
 ]
 
 
+def _nat_choice(v) -> str:
+    s = str(v).strip().lower()
+    if s in ("per_az", "per az", "per-az", "ha", "one per zone"):
+        return "per_az"
+    return _yes_no(v)
+
+
 def _vpc_notes(inputs) -> list[str]:
-    if inputs.get("nat_gateway") == "yes":
-        hourly = NAT_HOURLY + PUBLIC_IPV4_HOURLY
-        return [f"COST: NAT gateway ~${NAT_HOURLY}/h + public IPv4 ~${PUBLIC_IPV4_HOURLY}/h = ~${hourly:.3f}/hour "
-                f"(~${hourly * HOURS_PER_MONTH:.0f}/month) + ${NAT_PER_GB}/GB processed. Approximate us-east-1 "
-                f"prices at time of writing; verify current pricing. Run the teardown script when you are done.",
-                "VPC, subnets, route tables and the internet gateway themselves are free."]
-    return ["COST: VPC, subnets, route tables and the internet gateway are free."]
+    extra = []
+    if inputs.get("flow_logs") == "yes":
+        extra.append("Flow logs go to CloudWatch Logs (~$0.50/GB ingested), kept 14 days.")
+    if inputs.get("s3_endpoint", "yes") == "yes":
+        extra.append("The S3 gateway endpoint is free and keeps S3 traffic off the NAT gateway.")
+    if inputs.get("nat_gateway") in ("yes", "per_az"):
+        n = len(inputs.get("azs") or [1]) if inputs.get("nat_gateway") == "per_az" else 1
+        hourly = n * (NAT_HOURLY + PUBLIC_IPV4_HOURLY)
+        return [f"COST: {n} NAT gateway(s) ~${NAT_HOURLY}/h + public IPv4 ~${PUBLIC_IPV4_HOURLY}/h each = "
+                f"~${hourly:.3f}/hour (~${hourly * HOURS_PER_MONTH:.0f}/month) + ${NAT_PER_GB}/GB processed. "
+                f"Approximate us-east-1 prices at time of writing; verify current pricing. Run the teardown script "
+                f"when you are done.", "VPC, subnets, route tables and the internet gateway themselves are free."] + extra
+    return ["COST: VPC, subnets, route tables and the internet gateway are free."] + extra
 
 
 def _build_vpc(env, v) -> ScriptDraft:
     name, net = v["name"], ipaddress.ip_network(v["cidr"])
     n_pub, n_priv, azs = v["public_subnets"], v["private_subnets"], v["azs"]
-    nat = v.get("nat_gateway") == "yes" and n_priv > 0
+    nat = v.get("nat_gateway") in ("yes", "per_az") and n_priv > 0
+    per_az = v.get("nat_gateway") == "per_az" and nat
     blocks = list(net.subnets(new_prefix=_subnet_prefix(net)))
     steps: list[dict] = []
 
@@ -360,6 +376,10 @@ def _build_vpc(env, v) -> ScriptDraft:
         {"CidrBlock": str(net), "TagSpecifications": _tags("vpc", name)}, save_as="vpc",
         undo={"operation": "delete_vpc", "params": {"VpcId": vpc_id}, "description": f"Delete VPC {name}"})
     add("Enable DNS hostnames", "modify_vpc_attribute", {"VpcId": vpc_id, "EnableDnsHostnames": {"Value": True}})
+    ipv6 = v.get("ipv6") == "yes"
+    if ipv6:
+        add("Add an Amazon-provided IPv6 range (/56)", "associate_vpc_cidr_block",
+            {"VpcId": vpc_id, "AmazonProvidedIpv6CidrBlock": True}, save_as="v6")
     igw = "{{igw.InternetGateway.InternetGatewayId}}"
     add("Create internet gateway", "create_internet_gateway",
         {"TagSpecifications": _tags("internet-gateway", f"{name}-igw")}, save_as="igw",
@@ -406,24 +426,77 @@ def _build_vpc(env, v) -> ScriptDraft:
 
     if pub:
         route_table("public", "rt_public", pub, ("internet gateway", "GatewayId", igw))
-    nat_id = "{{nat.NatGateway.NatGatewayId}}"
-    if nat:
-        add("Allocate an Elastic IP for the NAT gateway", "allocate_address",
-            {"Domain": "vpc", "TagSpecifications": _tags("elastic-ip", f"{name}-nat-eip")}, save_as="eip",
-            undo={"operation": "release_address", "params": {"AllocationId": "{{eip.AllocationId}}"},
+        if ipv6:
+            add("Public route table: ::/0 -> internet gateway (IPv6)", "create_route",
+                {"RouteTableId": "{{rt_public.RouteTable.RouteTableId}}", "DestinationIpv6CidrBlock": "::/0",
+                 "GatewayId": igw})
+
+    def nat_gateway(i):
+        sfx = str(i + 1) if per_az else ""
+        nid = "{{nat" + sfx + ".NatGateway.NatGatewayId}}"
+        add(f"Allocate an Elastic IP for NAT gateway {sfx}".rstrip(), "allocate_address",
+            {"Domain": "vpc", "TagSpecifications": _tags("elastic-ip", f"{name}-nat{sfx}-eip")}, save_as=f"eip{sfx}",
+            undo={"operation": "release_address", "params": {"AllocationId": "{{eip" + sfx + ".AllocationId}}"},
                   "description": "Release the NAT Elastic IP"})
-        add("Create NAT gateway in public subnet 1 (waits until available, ~2 min)", "create_nat_gateway",
-            {"SubnetId": pub[0], "AllocationId": "{{eip.AllocationId}}",
-             "TagSpecifications": _tags("natgateway", f"{name}-nat")}, save_as="nat",
-            wait={"waiter": "nat_gateway_available", "params": {"NatGatewayIds": [nat_id]}},
-            undo={"operation": "delete_nat_gateway", "params": {"NatGatewayId": nat_id},
+        add(f"Create NAT gateway in public subnet {i + 1} (waits until available, ~2 min)", "create_nat_gateway",
+            {"SubnetId": pub[i], "AllocationId": "{{eip" + sfx + ".AllocationId}}",
+             "TagSpecifications": _tags("natgateway", f"{name}-nat{sfx}")}, save_as=f"nat{sfx}",
+            wait={"waiter": "nat_gateway_available", "params": {"NatGatewayIds": [nid]}},
+            undo={"operation": "delete_nat_gateway", "params": {"NatGatewayId": nid},
                   "description": "Delete NAT gateway (waits until deleted)",
-                  "wait": {"waiter": "nat_gateway_deleted", "params": {"NatGatewayIds": [nat_id]}}})
-    if priv:
-        route_table("private", "rt_private", priv, ("NAT gateway", "NatGatewayId", nat_id) if nat else None)
+                  "wait": {"waiter": "nat_gateway_deleted", "params": {"NatGatewayIds": [nid]}}})
+        return nid
+
+    if per_az:
+        nats = [nat_gateway(i) for i in range(min(len(pub), len(priv)))]
+        for i, sid in enumerate(priv):
+            route_table(f"private-{i + 1}", f"rt_private{i + 1}", [sid],
+                        ("NAT gateway", "NatGatewayId", nats[i % len(nats)]))
+    else:
+        nat_id = nat_gateway(0) if nat else None
+        if priv:
+            route_table("private", "rt_private", priv, ("NAT gateway", "NatGatewayId", nat_id) if nat else None)
+    if v.get("s3_endpoint", "yes") == "yes":
+        rts = (["{{rt_public.RouteTable.RouteTableId}}"] if pub else []) + (
+            ["{{rt_private" + str(i + 1) + ".RouteTable.RouteTableId}}" for i in range(len(priv))] if per_az
+            else (["{{rt_private.RouteTable.RouteTableId}}"] if priv else []))
+        add("S3 gateway endpoint (free; private S3 access without NAT)", "create_vpc_endpoint",
+            {"VpcId": vpc_id, "ServiceName": f"com.amazonaws.{env.region_name}.s3", "VpcEndpointType": "Gateway",
+             "RouteTableIds": rts, "TagSpecifications": _tags("vpc-endpoint", f"{name}-s3")}, save_as="s3ep",
+            undo={"operation": "delete_vpc_endpoints",
+                  "params": {"VpcEndpointIds": ["{{s3ep.VpcEndpoint.VpcEndpointId}}"]},
+                  "description": "Delete the S3 endpoint"})
+    if v.get("flow_logs") == "yes":
+        import json as _json
+        from core.recipes import role_steps, tag_dict
+        group = f"/vpc/flowlogs/{name}"
+        steps.append({"service": "logs", "operation": "create_log_group",
+                      "params": {"logGroupName": group, "tags": tag_dict(name)}, "description": f"Log group {group}",
+                      "undo": {"service": "logs", "operation": "delete_log_group", "params": {"logGroupName": group},
+                               "description": "Delete the flow log group"}})
+        steps.append({"service": "logs", "operation": "put_retention_policy",
+                      "params": {"logGroupName": group, "retentionInDays": 14}, "description": "Keep flow logs 14 days"})
+        role = f"{name}-flowlogs"[:64]
+        steps.extend(role_steps(role, "vpc-flow-logs.amazonaws.com", [], key="flrole", pause=1))
+        doc = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": [
+            "logs:CreateLogStream", "logs:PutLogEvents", "logs:DescribeLogGroups", "logs:DescribeLogStreams"],
+            "Resource": f"arn:aws:logs:{env.region_name}:{env.account_id()}:log-group:{group}:*"}]}
+        steps.append({"service": "iam", "operation": "put_role_policy", "pause_after": 15,
+                      "params": {"RoleName": role, "PolicyName": "write-flow-logs", "PolicyDocument": _json.dumps(doc)},
+                      "description": "Allow flow logs to write only to that log group",
+                      "undo": {"service": "iam", "operation": "delete_role_policy",
+                               "params": {"RoleName": role, "PolicyName": "write-flow-logs"},
+                               "description": "Remove the flow logs policy"}})
+        add("Record all VPC traffic to CloudWatch Logs (flow logs)", "create_flow_logs",
+            {"ResourceIds": [vpc_id], "ResourceType": "VPC", "TrafficType": "ALL",
+             "LogDestinationType": "cloud-watch-logs", "LogGroupName": group,
+             "DeliverLogsPermissionArn": "{{flrole.Role.Arn}}"}, save_as="fl",
+            undo={"operation": "delete_flow_logs", "params": {"FlowLogIds": ["{{fl.FlowLogIds.0}}"]},
+                  "description": "Delete the flow log"})
 
     return ScriptDraft(title=f"Create VPC {name} ({net}) with {n_pub} public + {n_priv} private subnets"
-                             f"{', NAT' if nat else ''}", steps=steps, notes=_vpc_notes(v))
+                             f"{', NAT per zone' if per_az else ', NAT' if nat else ''}{', IPv6' if ipv6 else ''}",
+                       steps=steps, notes=_vpc_notes(v))
 
 
 VPC_TEMPLATE = Template(
@@ -447,8 +520,19 @@ VPC_TEMPLATE = Template(
                   why="Two zones keep the network working if one zone has an outage."),
         FieldSpec("nat_gateway", "Do you want a NAT gateway so private subnets can reach the internet?", "choice",
                   must_ask=True, default="no", options=lambda e, i: NAT_OPTIONS,
-                  validate=lambda e, i, v: _yes_no(v), relevant=lambda i: int(i.get("private_subnets", 2) or 0) > 0,
+                  validate=lambda e, i, v: _nat_choice(v), relevant=lambda i: int(i.get("private_subnets", 2) or 0) > 0,
                   why="Needed for updates/downloads from private subnets. It is billed per hour even when idle."),
+        FieldSpec("s3_endpoint", "Add a free S3 gateway endpoint?", "choice", default="yes",
+                  options=lambda e, i: [{"value": "yes", "label": "Yes (free)"}, {"value": "no", "label": "No"}],
+                  optional=True, validate=lambda e, i, v: _yes_no(v), why="Private subnets reach S3 without a NAT gateway."),
+        FieldSpec("ipv6", "Add IPv6?", "choice", default="no",
+                  options=lambda e, i: [{"value": "no", "label": "No (IPv4 only)"},
+                                        {"value": "yes", "label": "Yes, an Amazon-provided IPv6 /56"}],
+                  optional=True, validate=lambda e, i, v: _yes_no(v)),
+        FieldSpec("flow_logs", "Record network traffic (flow logs to CloudWatch)?", "choice", default="no",
+                  options=lambda e, i: [{"value": "no", "label": "No"},
+                                        {"value": "yes", "label": "Yes (~$0.50/GB of logs)"}],
+                  optional=True, validate=lambda e, i, v: _yes_no(v)),
     ],
     title=lambda i: f"VPC '{i.get('name', 'kintsugi-vpc')}'",
     build=_build_vpc,
@@ -636,7 +720,7 @@ def _question(f: FieldSpec, env: Env, inputs: dict, default=None, error: str = "
         opts = f.options(env, inputs) if f.options else []
     except Exception as e:
         opts, error = [], error or f"could not load options from AWS ({audit_error(e)})"
-    if f.kind in ("choice", "multichoice") and not opts and not error:
+    if f.kind in ("choice", "multichoice") and not opts and not error and not f.allow_empty:
         where = f" in {env.region}" if env.region else ""
         error = f.empty_hint or f"nothing found in your AWS account{where} for this"
     if default is None:
@@ -666,27 +750,48 @@ def audit_error(e: Exception) -> str:
     return type(e).__name__
 
 
+def _implies_custom(t: Template, inputs: dict) -> bool:
+    """An advanced option was given (it is only asked with settings='custom'), so the user wants custom settings."""
+    sf = next((f for f in t.fields if f.key == "settings"), None)
+    if "settings" in inputs or not sf or callable(sf.default):
+        return False
+    for f in t.fields:
+        if f.key not in inputs or not f.relevant:
+            continue
+        try:
+            if not f.relevant({**inputs, "settings": "default"}) and f.relevant({**inputs, "settings": "custom"}):
+                return True
+        except Exception:
+            continue
+    return False
+
+
 def plan(template: str, inputs: dict, conn, confirmed: set | None = None, region: str | None = None):
     """Return TaskQuestions (something is missing or must be confirmed) or a ready ScriptDraft.
 
     confirmed = keys the user has explicitly answered. None means all given inputs are confirmed
     (the answer form). For an LLM call, pass only the keys of fields that are not must_ask."""
+    load_catalog()
     if template not in TEMPLATES:
         raise TemplateError(f"unknown template '{template}'")
     t = TEMPLATES[template]
     env = Env(conn, region)
     empty_ok = {f.key for f in t.fields if f.allow_empty}
-    inputs = {k: v for k, v in (inputs or {}).items() if v not in (None, "", []) or (k in empty_ok and v == "")}
+    inputs = {k: v for k, v in (inputs or {}).items() if v not in (None, "", []) or (k in empty_ok and v in ("", []))}
     confirmed = set(inputs) if confirmed is None else set(confirmed)
+    if _implies_custom(t, inputs):
+        inputs["settings"] = "custom"
+        confirmed.add("settings")
     from core import prereqs
     report = prereqs.for_template(template, inputs, env)
     if report and report.blocking:
         report.confirmed = sorted(confirmed)
         return report
     values: dict = {}
+    provisional: dict = {}
     questions: list[Question] = []
     for f in t.fields:
-        cur = {**inputs, **values}
+        cur = {**provisional, **inputs, **values}
         if f.relevant and not f.relevant(cur):
             continue
         if f.relevant_env:
@@ -695,6 +800,12 @@ def plan(template: str, inputs: dict, conn, confirmed: set | None = None, region
                     continue
             except Exception:
                 pass
+        if f.key not in inputs and f.optional:
+            try:
+                values[f.key] = f.default(env, cur) if callable(f.default) else f.default
+            except Exception:
+                pass
+            continue
         if f.key in inputs:
             try:
                 val = f.validate(env, cur, inputs[f.key]) if f.validate else inputs[f.key]
@@ -711,7 +822,10 @@ def plan(template: str, inputs: dict, conn, confirmed: set | None = None, region
             if f.must_ask and f.key not in confirmed:
                 questions.append(_question(f, env, {**inputs, **values}, default=val))
             continue
-        questions.append(_question(f, env, cur))
+        q = _question(f, env, cur)
+        questions.append(q)
+        if q.default not in (None, "", []):
+            provisional[f.key] = q.default
     merged = {**inputs, **values}
     if questions:
         asked = {q.key for q in questions}
@@ -751,5 +865,12 @@ def submit(owner: str, request: str, template: str, inputs: dict, conn, confirme
     return {"script": saved}
 
 
+def load_catalog() -> None:
+    """Every recipe module registers itself in TEMPLATES when imported (core/catalog.py imports them all)."""
+    import importlib
+    importlib.import_module("core.catalog")
+
+
 def must_ask_keys(template: str) -> set[str]:
+    load_catalog()
     return {f.key for f in TEMPLATES[template].fields if f.must_ask}
