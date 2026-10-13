@@ -7,7 +7,7 @@ from core.cron import AwsCron, CronError, describe_rate, expression_kind, parse_
 
 UTC = timezone.utc
 IST = ZoneInfo("Asia/Kolkata")
-START = datetime(2026, 10, 3, 0, 0, tzinfo=UTC)  # Saturday
+START = datetime(2026, 10, 3, 0, 0, tzinfo=UTC)
 
 
 class TestAwsCron(unittest.TestCase):
@@ -24,14 +24,14 @@ class TestAwsCron(unittest.TestCase):
 
     def test_day_of_week_one_is_sunday(self):
         runs = AwsCron.parse("cron(0 0 ? * 1 *)").next_runs(START, "UTC", count=4)
-        self.assertTrue(all(r.weekday() == 6 for r in runs))  # Python: Sunday == 6
+        self.assertTrue(all(r.weekday() == 6 for r in runs))
         runs = AwsCron.parse("cron(0 0 ? * 2 *)").next_runs(START, "UTC", count=4)
-        self.assertTrue(all(r.weekday() == 0 for r in runs))  # 2 == Monday
+        self.assertTrue(all(r.weekday() == 0 for r in runs))
 
     def test_weekday_names_and_range(self):
         runs = AwsCron.parse("cron(0 9 ? * MON-FRI *)").next_runs(START, "UTC", count=10)
         self.assertTrue(all(r.weekday() < 5 for r in runs))
-        self.assertEqual(runs[0], datetime(2026, 10, 5, 9, 0, tzinfo=UTC))  # Monday after Sat START
+        self.assertEqual(runs[0], datetime(2026, 10, 5, 9, 0, tzinfo=UTC))
 
     def test_wraparound_dow_range(self):
         runs = AwsCron.parse("cron(0 0 ? * FRI-MON *)").next_runs(START, "UTC", count=8)
@@ -48,15 +48,14 @@ class TestAwsCron(unittest.TestCase):
 
     def test_last_friday(self):
         runs = AwsCron.parse("cron(0 0 ? * 6L *)").next_runs(START, "UTC", count=2)
-        self.assertEqual([r.day for r in runs], [30, 27])  # Oct 30 and Nov 27, 2026
+        self.assertEqual([r.day for r in runs], [30, 27])
         self.assertTrue(all(r.weekday() == 4 for r in runs))
 
     def test_nth_weekday(self):
         runs = AwsCron.parse("cron(0 0 ? * 6#3 *)").next_runs(START, "UTC", count=1)
-        self.assertEqual(runs[0].date().isoformat(), "2026-10-16")  # 3rd Friday of Oct 2026
+        self.assertEqual(runs[0].date().isoformat(), "2026-10-16")
 
     def test_nearest_weekday(self):
-        # 2026-11-15 is a Sunday -> nearest weekday is Monday the 16th
         runs = AwsCron.parse("cron(0 0 15W 11 ? 2026)").next_runs(START, "UTC", count=1)
         self.assertEqual(runs[0].date().isoformat(), "2026-11-16")
 
@@ -73,12 +72,12 @@ class TestAwsCron(unittest.TestCase):
         self.assertEqual(runs[0].astimezone(UTC), datetime(2026, 10, 3, 9, 30, tzinfo=UTC))
 
     def test_invalid_expressions(self):
-        for bad in ("cron(0 0 * * * *)",        # neither day field is '?'
-                    "cron(0 0 ? * ? *)",        # both are '?'
-                    "cron(0 0 * * ?)",          # five fields
-                    "cron(60 0 * * ? *)",       # minute out of range
-                    "cron(0 24 * * ? *)",       # hour out of range
-                    "cron(0 0 ? * 8 *)",        # dow out of range
+        for bad in ("cron(0 0 * * * *)",
+                    "cron(0 0 ? * ? *)",
+                    "cron(0 0 * * ?)",
+                    "cron(60 0 * * ? *)",
+                    "cron(0 24 * * ? *)",
+                    "cron(0 0 ? * 8 *)",
                     "cron(0 0 ? * FOO *)"):
             with self.subTest(bad=bad), self.assertRaises(CronError):
                 AwsCron.parse(bad)

@@ -52,7 +52,7 @@ def _parse_set(field: str, lo: int, hi: int, names: dict | None = None) -> set[i
             raise CronError(f"value out of range {lo}-{hi} in '{field}'")
         if start <= end:
             result.update(range(start, end + 1, step))
-        else:  # wrap-around range, e.g. FRI-MON
+        else:
             seq = list(range(start, hi + 1)) + list(range(lo, end + 1))
             result.update(seq[::step])
     return result
@@ -96,11 +96,9 @@ class AwsCron:
             dow=dow.upper(),
             years=None if yr in ("*", "?") else _parse_set(yr, 1970, 2199),
         )
-        # Validate day fields eagerly so bad expressions fail at parse time.
         c._day_matches(date(2024, 1, 1))
         return c
 
-    # -- day matching --------------------------------------------------------------
     def _dom_matches(self, d: date) -> bool:
         f = self.dom
         if f in ("*", "?"):
@@ -144,7 +142,7 @@ class AwsCron:
                 target = _value(part[:-1], _DOWS)
                 if wd == target and d.day + 7 > last:
                     return True
-            elif part == "L":  # 'L' alone in day-of-week = Saturday (7)
+            elif part == "L":
                 if wd == 7:
                     return True
             elif wd in _parse_set(part, 1, 7, _DOWS):
@@ -158,7 +156,6 @@ class AwsCron:
             return False
         return self._dom_matches(d) and self._dow_matches(d)
 
-    # -- run times -----------------------------------------------------------------
     def next_runs(self, after: datetime, tz: str = "UTC", count: int = 5, max_days: int = 400) -> list[datetime]:
         """Next `count` run times strictly after `after`, evaluated in timezone `tz` (tz-aware results)."""
         zone = ZoneInfo(tz)
@@ -183,15 +180,13 @@ class AwsCron:
 def _nearest_weekday(year: int, month: int, day: int) -> date:
     """AWS 'W': nearest weekday (Mon-Fri) to the given day, never crossing into another month."""
     d = date(year, month, day)
-    if d.weekday() == 5:  # Saturday
+    if d.weekday() == 5:
         return d - timedelta(days=1) if day > 1 else d + timedelta(days=2)
-    if d.weekday() == 6:  # Sunday
+    if d.weekday() == 6:
         last = calendar.monthrange(year, month)[1]
         return d + timedelta(days=1) if day < last else d - timedelta(days=2)
     return d
 
-
-# ---- rate(...) and at(...) -------------------------------------------------------
 
 _RATE_RE = re.compile(r"\s*rate\(\s*(\d+)\s+(minute|minutes|hour|hours|day|days)\s*\)\s*", re.I)
 _AT_RE = re.compile(r"\s*at\(\s*(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\s*\)\s*", re.I)

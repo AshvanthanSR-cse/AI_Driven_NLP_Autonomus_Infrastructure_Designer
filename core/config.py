@@ -34,7 +34,8 @@ class Settings:
 
     app_secret_key: str = field(default=_get("APP_SECRET_KEY"), repr=False)
 
-    # Agent limits
+    audit_keep_last: int = int(_get("AUDIT_KEEP_LAST", "50"))
+
     max_tool_rounds: int = 5
     max_tool_result_chars: int = 6000
 

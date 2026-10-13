@@ -16,7 +16,6 @@ class FakeEc2Infra:
         self.calls = []
         self.n = 0
 
-    # --- reads used for options
     def describe_availability_zones(self, Filters=None):
         return {"AvailabilityZones": [{"ZoneName": z, "ZoneType": "availability-zone"}
                                       for z in ("us-east-1a", "us-east-1b", "us-east-1c")]}
@@ -40,7 +39,6 @@ class FakeEc2Infra:
     def describe_images(self, ImageIds):
         return {"Images": [{"ImageId": ImageIds[0], "RootDeviceName": "/dev/xvda", "Name": "al2023"}]}
 
-    # --- writes (used by the runner test)
     def _id(self, prefix):
         self.n += 1
         return f"{prefix}-{self.n:04d}"
@@ -95,7 +93,7 @@ class TestVpcQuestions(unittest.TestCase):
         q = templates.plan("vpc_network", guessed, conn(), confirmed)
         self.assertIsInstance(q, TaskQuestions)
         asked = {x.key: x.default for x in q.questions}
-        self.assertEqual(asked["cidr"], "10.20.0.0/16")   # pre-filled with the guess
+        self.assertEqual(asked["cidr"], "10.20.0.0/16")
         self.assertIn("nat_gateway", asked)
 
     def test_bad_answers_come_back_with_errors(self):
@@ -103,7 +101,7 @@ class TestVpcQuestions(unittest.TestCase):
                           ("10.0.0.0/24", None)]:
             q = templates.plan("vpc_network", {**FULL_VPC, "cidr": cidr}, conn())
             if msg is None:
-                self.assertIsInstance(q, ScriptDraft, cidr)  # /24 still fits 4 /26 subnets
+                self.assertIsInstance(q, ScriptDraft, cidr)
                 continue
             err = next(x.error for x in q.questions if x.key == "cidr")
             self.assertIn(msg, err, cidr)
@@ -120,7 +118,7 @@ class TestVpcScript(unittest.TestCase):
     def test_steps_are_valid_aws_calls(self):
         self.assertIsInstance(self.draft, ScriptDraft)
         for st in self.draft.steps:
-            scripts.validate_step(st)  # botocore model validation of every call
+            scripts.validate_step(st)
             if st.get("undo"):
                 scripts.check_write_allowed(st["undo"]["service"], st["undo"]["operation"], {})
         ops = [s["operation"] for s in self.draft.steps]
@@ -159,11 +157,10 @@ class TestRunAndTeardown(unittest.TestCase):
             res = scripts.run_script("tester", 9, c)
         self.assertTrue(res["ok"], res["log"])
         calls = dict((op, p) for op, p in ec2.calls if not op.startswith("describe"))
-        self.assertEqual(calls["create_subnet"]["VpcId"], "vpc-0001")           # placeholder resolved
+        self.assertEqual(calls["create_subnet"]["VpcId"], "vpc-0001")
         self.assertTrue(calls["create_nat_gateway"]["SubnetId"].startswith("subnet-"))
         self.assertIn("wait:nat_gateway_available", [op for op, _ in ec2.calls])
         self.assertIn(("ec2", "operate"), c.requested)
-        # teardown: reverse order, real IDs, destructive
         td = saved["d"]
         ops = [s["operation"] for s in td.steps]
         self.assertEqual(ops[-1], "delete_vpc")
@@ -210,7 +207,7 @@ class TestEc2Template(unittest.TestCase):
         with mock.patch.object(templates.Env, "my_ip", return_value="203.0.113.5"):
             q = templates.plan("ec2_instance", {"subnet_id": "subnet-pub"}, conn(), confirmed={"subnet_id"})
         by = {x.key: x for x in q.questions}
-        self.assertNotIn("subnet_id", by)  # already answered
+        self.assertNotIn("subnet_id", by)
         self.assertIn("purpose", by)
         self.assertIn("os", by)
         self.assertEqual([o["value"] for o in by["security_group"].options], ["new", "sg-web"])
@@ -226,9 +223,10 @@ class TestEc2Template(unittest.TestCase):
         c = conn()
         c.clients["ec2"].describe_subnets = lambda: {"Subnets": []}
         q = templates.plan("ec2_instance", {}, c, confirmed=set())
-        by = {x.key: x for x in q.questions}
-        self.assertIn("Create a VPC", by["subnet_id"].error)
-        self.assertIn("admin_cidr", by)  # SSH source is asked up front
+        from core.prereqs import PrereqReport
+        self.assertIsInstance(q, PrereqReport)
+        self.assertEqual([i.key for i in q.missing], ["subnets"])
+        self.assertIn("Create a VPC", q.missing[0].how)
 
     def test_blocks_big_instances_and_unknown_subnet(self):
         q = templates.plan("ec2_instance", {**FULL_EC2, "instance_type": "m5.24xlarge", "subnet_id": "subnet-nope"}, conn())
@@ -270,7 +268,6 @@ class TestPlanTaskTool(unittest.TestCase):
             first = tools.create_script("plan_task", args, ctx)
         self.assertIn("questions", first)
         pending = first["questions"]
-        # the user answers in chat: "use 10.20.0.0/16, name lab, zones a and b, yes NAT"
         ctx2 = ToolContext(conn=c, request="answers", pending_task=pending)
         args2 = tools.validate_args("plan_task", {"template": "vpc_network", "inputs": {
             "cidr": "10.20.0.0/16", "name": "lab", "azs": ["us-east-1a", "us-east-1b"], "nat_gateway": "yes"}})
@@ -284,3 +281,21 @@ class TestPlanTaskTool(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestAwsErrorText(unittest.TestCase):
+    def test_clock_skew_explained(self):
+        from botocore.exceptions import ClientError
+        e = ClientError({"Error": {"Code": "RequestTimeTooSkewed",
+                                   "Message": "The difference between the request time and the current time is too large."}},
+                        "ListBuckets")
+        self.assertIn("clock", templates.audit_error(e))
+        e = ClientError({"Error": {"Code": "SignatureDoesNotMatch", "Message": "Signature expired: 2026..."}},
+                        "GetCallerIdentity")
+        self.assertIn("clock", templates.audit_error(e))
+
+    def test_other_errors_stay_short(self):
+        from botocore.exceptions import ClientError
+        e = ClientError({"Error": {"Code": "SignatureDoesNotMatch", "Message": "The secret key is wrong"}}, "X")
+        self.assertEqual(templates.audit_error(e), "SignatureDoesNotMatch")
+        self.assertEqual(templates.audit_error(ValueError("x")), "ValueError")

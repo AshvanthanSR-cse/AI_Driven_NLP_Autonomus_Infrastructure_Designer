@@ -13,7 +13,6 @@ from tests.fakes import DEMO_INSTANCES, FakeConn, FakeEc2, FakeEvents, FakeSched
 
 
 def setUpModule():
-    # Never touch the real DB from unit tests.
     global _patch
     _patch = mock.patch.object(audit, "log_action", return_value=None)
     _patch.start()
@@ -77,10 +76,8 @@ class TestValidation(unittest.TestCase):
         specs = tools.openai_tool_specs()
         self.assertTrue(all(s["type"] == "function" and "parameters" in s["function"] for s in specs))
         by_name = {s["function"]["name"]: s["function"]["parameters"] for s in specs}
-        # metadata titles are stripped ...
         self.assertNotIn("title", by_name["list_ec2_instances"])
         self.assertNotIn("title", by_name["list_ec2_instances"]["properties"]["state"])
-        # ... but a real parameter called 'title' is kept, and every required parameter is described
         self.assertIn("title", by_name["aws_write"]["properties"])
         for name, params in by_name.items():
             for req in params.get("required", []):
@@ -106,8 +103,13 @@ class TestRouter(unittest.TestCase):
                 self.assertEqual(router.route(text), expected)
 
     def test_no_route(self):
+        self.assertEqual(router.route("create a postgres database"),
+                         ("plan_task", {"template": "database", "inputs": {"engine": "postgres"}}))
+        self.assertEqual(router.route("build a DynamoDB table for orders"),
+                         ("plan_task", {"template": "database", "inputs": {"engine": "dynamodb"}}))
+        self.assertEqual(router.route("what rds instances do I have?"), ("list_rds_instances", {}))
         self.assertIsNone(router.route("tell me a joke"))
-        self.assertIsNone(router.route("stop it"))  # stop without an instance is not routed
+        self.assertIsNone(router.route("stop it"))
 
 
 class TestWriteTools(unittest.TestCase):
@@ -146,13 +148,12 @@ class TestWriteTools(unittest.TestCase):
         def draft(**kw):
             args = tools.validate_args("aws_write", {"title": "b", "service": "s3", "operation": "create_bucket", **kw})
             return tools.REGISTRY["aws_write"].func(self.ctx, args).steps[0]
-        # the model's real mistake: location ap-south-1 but API region us-east-1
         s = draft(params={"Bucket": "b-1", "CreateBucketConfiguration": {"LocationConstraint": "ap-south-1"}},
                   region="us-east-1")
         self.assertEqual(s["region"], "ap-south-1")
-        s = draft(params={"Bucket": "b-1"}, region="eu-west-1")  # no constraint: the region is added
+        s = draft(params={"Bucket": "b-1"}, region="eu-west-1")
         self.assertEqual(s["params"]["CreateBucketConfiguration"]["LocationConstraint"], s["region"])
-        s = draft(params={"Bucket": "b-1"}, region="us-east-1")  # us-east-1 must have no constraint
+        s = draft(params={"Bucket": "b-1"}, region="us-east-1")
         self.assertNotIn("CreateBucketConfiguration", s["params"])
 
     def test_create_script_saves_draft(self):
@@ -224,6 +225,42 @@ class TestAgent(unittest.TestCase):
         self.assertFalse(res.llm_available)
         self.assertIn("hello-12pm-ist", res.text)
         self.assertIn("Asia/Kolkata", res.text)
+
+    def test_new_task_is_planned_without_old_chat(self):
+        """An earlier S3 task must not leak S3 policies into a new IAM role task."""
+        history = [{"role": "user", "content": "host my site in S3 bucket web-1"},
+                   {"role": "assistant", "content": "Which bucket?"}]
+        pending = {"template": "s3_upload", "inputs": {"bucket": "web-1"}, "questions": [], "confirmed": []}
+        seen = []
+        leaky = _msg(calls=[("plan_task", '{"template": "iam_role", "inputs": {"service": "lambda", '
+                                          '"policies": ["AmazonS3FullAccess"]}}')])
+        clean = _msg(calls=[("plan_task", '{"template": "iam_role", "inputs": {"service": "lambda"}}')])
+
+        def fake_chat(messages, tools_=None):
+            text = " ".join(str(m.get("content")) for m in messages)
+            seen.append("web-1" in text)
+            if len(seen) == 1:
+                return leaky
+            return clean if len(seen) == 2 else _msg("questions")
+        questions = {"questions": {"template": "iam_role", "title": "IAM role", "questions": [], "notes": []}}
+        with mock.patch.object(agent.llm, "chat", side_effect=fake_chat), \
+                mock.patch.object(tools, "create_script", return_value=questions) as cs:
+            res = agent.run("create an IAM role for Lambda", self.ctx, history, pending_task=pending)
+        self.assertEqual(seen[:2], [True, False])
+        self.assertEqual(cs.call_args[0][1].inputs, {"service": "lambda"})
+        self.assertIsNone(self.ctx.pending_task)
+        self.assertEqual(res.questions["template"], "iam_role")
+
+    def test_answering_open_questions_keeps_context(self):
+        pending = {"template": "s3_upload", "inputs": {"source": "D:\\x"}, "questions": [], "confirmed": []}
+        replies = iter([_msg(calls=[("plan_task", '{"template": "s3_upload", "inputs": {"bucket": "new"}}')]),
+                        _msg("ok")])
+        questions = {"questions": {"template": "s3_upload", "title": "S3", "questions": [], "notes": []}}
+        with mock.patch.object(agent.llm, "chat", side_effect=lambda *a, **k: next(replies)), \
+                mock.patch.object(tools, "create_script", return_value=questions):
+            res = agent.run("a new bucket", self.ctx, [{"role": "user", "content": "upload"}], pending_task=pending)
+        self.assertEqual(self.ctx.pending_task, pending)
+        self.assertEqual(res.text, "ok")
 
 
 if __name__ == "__main__":

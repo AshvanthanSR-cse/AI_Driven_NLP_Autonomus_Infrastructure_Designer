@@ -1,7 +1,9 @@
 """Scripts page: every write request from chat lands here.
 
-Flow: read the script -> ✔ Approve or ✖ Deny (or ✏ Edit it yourself) -> ▶ Run now or ⏰ Schedule.
+Flow: read the script -> Approve or Deny (or edit it yourself) -> Run now or Schedule.
 Scripts written by the agent can never run before you approve them; an edited script needs a new approval.
+Delete removes only the script from Kintsugi, never anything in AWS (select several in the list, or delete
+every script that is still waiting for review or was denied).
 """
 from datetime import datetime, timedelta
 
@@ -14,13 +16,16 @@ from PySide6.QtWidgets import (
 
 from core import scripts
 from core.config import settings
-from gui.common import LOCAL_TZ, fill_table, fmt_time
+from gui.common import LOCAL_TZ, fill_table, fmt_time, style_table
+from gui.theme import DANGER, SUCCESS, page_title, primary
 
-STATUS_ICON = {"draft": "🟡 waiting for your review", "approved": "✔ approved", "denied": "✖ denied",
-               "scheduled": "⏰ scheduled", "running": "▶ running", "succeeded": "✅ succeeded",
-               "failed": "❌ failed", "cancelled": "⏹ cancelled"}
+STATUS_ICON = {"draft": "waiting for your review", "approved": "approved", "denied": "denied",
+               "scheduled": "scheduled", "running": "running", "succeeded": "succeeded",
+               "failed": "failed", "cancelled": "cancelled"}
 
-EDIT_HELP = ("Edit the steps CloudAI will run (JSON). Each step: service, operation (boto3 names), params; optional "
+DELETE_STYLE = f"QPushButton {{ font-weight: 600; color: {DANGER}; }} QPushButton:disabled {{ color: #a0a7b4; }}"
+
+EDIT_HELP = ("Edit the steps Kintsugi will run (JSON). Each step: service, operation (boto3 names), params; optional "
              "description, region, save_as, wait, undo. Values like {{vpc.Vpc.VpcId}} come from an earlier step's "
              "save_as. Everything is checked again when you save, and the script must be approved again.")
 
@@ -45,30 +50,42 @@ class ScriptsPage(QWidget):
         lay.setContentsMargins(0, 0, 0, 0)
         lay.addWidget(self.stack)
 
-    # ================= list view =================
     def _build_list(self) -> QWidget:
         w = QWidget()
         self.table = QTableWidget()
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.cellDoubleClicked.connect(lambda r, _c: self._open_row(r))
-        open_btn = QPushButton("Open script")
+        open_btn = primary(QPushButton("Open script"))
         open_btn.clicked.connect(lambda: self._open_row(self.table.currentRow()))
         refresh = QPushButton("Refresh")
         refresh.clicked.connect(self.refresh)
+        del_sel = QPushButton("Delete selected")
+        del_sel.setStyleSheet(DELETE_STYLE)
+        del_sel.setToolTip("Delete the selected scripts (Ctrl/Shift-click to select several). Nothing in AWS is touched.")
+        del_sel.clicked.connect(self.delete_selected)
+        del_unapproved = QPushButton("Delete all not approved")
+        del_unapproved.setStyleSheet(DELETE_STYLE)
+        del_unapproved.setToolTip("Delete every script that is still waiting for review or was denied.")
+        del_unapproved.clicked.connect(self.delete_unapproved)
         self.list_info = QLabel("")
         top = QHBoxLayout()
         top.addWidget(open_btn)
         top.addWidget(refresh)
+        top.addSpacing(16)
+        top.addWidget(del_sel)
+        top.addWidget(del_unapproved)
         top.addWidget(self.list_info, 1)
         lay = QVBoxLayout(w)
-        lay.addWidget(QLabel("<h3>Scripts</h3>When you ask the AI to change something, it writes a script here. "
-                             "Open it, read it, then <b>Approve</b> or <b>Deny</b> it (or edit it yourself). "
-                             "Only approved scripts can be run or scheduled."))
+        lay.setContentsMargins(16, 14, 16, 14)
+        lay.addWidget(page_title("Scripts", "When you ask the AI to change something, it writes a script here. "
+                                 "Open it, read it, then Approve or Deny it (or edit it yourself). "
+                                 "Only approved scripts can be run or scheduled."))
         lay.addLayout(top)
         lay.addWidget(self.table, 1)
+        style_table(self.table)
         return w
 
     def refresh(self):
@@ -82,10 +99,50 @@ class ScriptsPage(QWidget):
                    fmt={"status": lambda r: STATUS_ICON.get(r["status"], r["status"])})
         waiting = sum(r["status"] == "draft" for r in rows)
         self.list_info.setText(f"{len(rows)} script(s)" + (f" · {waiting} waiting for your review" if waiting else "")
-                               + " · double-click to open")
+                               + " · double-click to open · Ctrl/Shift-click to select several")
         for i, r in enumerate(rows):
             if r["id"] == selected:
                 self.table.selectRow(i)
+
+    def _selected_ids(self) -> list[int]:
+        rows = sorted({i.row() for i in self.table.selectedIndexes()})
+        return [self.rows[r]["id"] for r in rows if 0 <= r < len(self.rows)]
+
+    def delete_selected(self):
+        ids = self._selected_ids()
+        if not ids:
+            self.list_info.setText("Select one or more scripts first (Ctrl/Shift-click for several).")
+            return
+        listing = ", ".join(f"#{i}" for i in ids)
+        if QMessageBox.question(self, "Delete scripts", f"Delete {len(ids)} script(s): {listing}?\n\n"
+                                "This deletes only the scripts in Kintsugi, not anything in AWS. "
+                                "A deleted teardown script cannot be recovered.") != QMessageBox.Yes:
+            return
+        self.pool.start(scripts.delete_scripts, self.owner, ids, on_done=self._deleted,
+                        on_fail=lambda m: QMessageBox.warning(self, "Delete", m))
+
+    def delete_unapproved(self):
+        n = sum(r["status"] in ("draft", "denied") for r in self.rows)
+        if not n:
+            self.list_info.setText("No scripts are waiting for review or denied.")
+            return
+        if QMessageBox.question(self, "Delete not approved",
+                                f"Delete all {n} script(s) that are waiting for review or were denied?\n\n"
+                                "Approved, scheduled and finished scripts are kept. Nothing in AWS is touched."
+                                ) != QMessageBox.Yes:
+            return
+        self.pool.start(scripts.delete_unapproved, self.owner, on_done=self._deleted,
+                        on_fail=lambda m: QMessageBox.warning(self, "Delete", m))
+
+    def _deleted(self, res: dict):
+        msg = f"Deleted {len(res['deleted'])} script(s)."
+        if res["skipped"]:
+            msg += " Skipped (running now): " + ", ".join(f"#{i}" for i in res["skipped"]) + "."
+        if self.current and self.current["id"] in res["deleted"]:
+            self.current = None
+        self.on_activity()
+        self.pool.start(scripts.list_scripts, self.owner,
+                        on_done=lambda rows: (self._show_list(rows), self.list_info.setText(msg)))
 
     def _open_row(self, r: int):
         if 0 <= r < len(self.rows):
@@ -93,10 +150,9 @@ class ScriptsPage(QWidget):
         else:
             self.list_info.setText("Select a script in the list first.")
 
-    # ================= detail view =================
     def _build_detail(self) -> QWidget:
         w = QWidget()
-        back = QPushButton("← All scripts")
+        back = QPushButton("< All scripts")
         back.clicked.connect(self.show_list)
         self.d_title = QLabel()
         self.d_title.setTextFormat(Qt.RichText)
@@ -107,53 +163,55 @@ class ScriptsPage(QWidget):
         mono = QFont("Consolas")
         mono.setStyleHint(QFont.Monospace)
 
-        self.d_text = QPlainTextEdit()                # read view: AWS CLI equivalent
+        self.d_text = QPlainTextEdit()
         self.d_text.setReadOnly(True)
         self.d_text.setFont(mono)
-        self.d_editor = QPlainTextEdit()              # edit view: the steps that run (JSON)
+        self.d_editor = QPlainTextEdit()
         self.d_editor.setFont(mono)
         self.d_editor.hide()
         self.edit_help = QLabel(EDIT_HELP)
         self.edit_help.setWordWrap(True)
-        self.edit_help.setStyleSheet("color: gray;")
+        self.edit_help.setObjectName("Muted")
         self.edit_help.hide()
         self.script_label = QLabel("<b>Script</b> (read it before approving)")
 
         self.d_result = QPlainTextEdit()
         self.d_result.setReadOnly(True)
         self.d_result.setFont(mono)
-        self.d_result.setMaximumHeight(140)
+        self.d_result.setMaximumHeight(220)
 
-        # --- review bar: Approve / Deny / Edit
-        self.approve_btn = QPushButton("✔ Approve")
-        self.approve_btn.setStyleSheet("QPushButton { font-weight: bold; color: #1e8449; } QPushButton:disabled { color: #aaaaaa; }")
-        self.deny_btn = QPushButton("✖ Deny")
-        self.deny_btn.setStyleSheet("QPushButton { font-weight: bold; color: #c0392b; } QPushButton:disabled { color: #aaaaaa; }")
-        self.edit_btn = QPushButton("✏ Edit script")
-        self.save_edit_btn = QPushButton("💾 Save changes")
-        self.save_edit_btn.setStyleSheet("font-weight: bold;")
+        self.approve_btn = QPushButton("Approve")
+        self.approve_btn.setStyleSheet(f"QPushButton {{ font-weight: 600; color: {SUCCESS}; }} "
+                                       f"QPushButton:disabled {{ color: #a0a7b4; }}")
+        self.deny_btn = QPushButton("Deny")
+        self.deny_btn.setStyleSheet(DELETE_STYLE)
+        self.edit_btn = QPushButton("Edit script")
+        self.save_edit_btn = QPushButton("Save changes")
+        primary(self.save_edit_btn)
         self.discard_edit_btn = QPushButton("Discard changes")
         self.save_edit_btn.hide()
         self.discard_edit_btn.hide()
         self.review_state = QLabel()
+        self.delete_btn = QPushButton("Delete script")
+        self.delete_btn.setStyleSheet(DELETE_STYLE)
+        self.delete_btn.setToolTip("Delete this script from Kintsugi (nothing in AWS is changed)")
         review = QFrame()
-        review.setFrameShape(QFrame.StyledPanel)
+        review.setObjectName("Card")
         rl = QHBoxLayout(review)
         rl.addWidget(QLabel("<b>Review:</b>"))
         for b in (self.approve_btn, self.deny_btn, self.edit_btn, self.save_edit_btn, self.discard_edit_btn):
             rl.addWidget(b)
         rl.addWidget(self.review_state, 1)
+        rl.addWidget(self.delete_btn)
 
-        # --- run bar: Run now / Dry run / Schedule
-        self.run_btn = QPushButton("▶ Run now")
-        self.run_btn.setStyleSheet("font-weight: bold;")
+        self.run_btn = QPushButton("Run now")
+        primary(self.run_btn)
         self.dry_btn = QPushButton("Dry run (check only)")
         self.when = QDateTimeEdit()
         self.when.setCalendarPopup(True)
         self.when.setDisplayFormat("yyyy-MM-dd HH:mm")
-        self.sched_btn = QPushButton("⏰ Schedule")
+        self.sched_btn = QPushButton("Schedule")
         self.cancel_btn = QPushButton("Cancel schedule")
-        self.delete_btn = QPushButton("Delete")
         run_bar = QHBoxLayout()
         run_bar.addWidget(QLabel("<b>Run:</b>"))
         run_bar.addWidget(self.run_btn)
@@ -164,7 +222,6 @@ class ScriptsPage(QWidget):
         run_bar.addWidget(self.sched_btn)
         run_bar.addWidget(self.cancel_btn)
         run_bar.addStretch()
-        run_bar.addWidget(self.delete_btn)
 
         self.approve_btn.clicked.connect(self.approve)
         self.deny_btn.clicked.connect(self.deny)
@@ -178,6 +235,7 @@ class ScriptsPage(QWidget):
         self.delete_btn.clicked.connect(self.delete)
 
         lay = QVBoxLayout(w)
+        lay.setContentsMargins(16, 14, 16, 14)
         top = QHBoxLayout()
         top.addWidget(back)
         top.addWidget(self.d_title, 1)
@@ -191,7 +249,7 @@ class ScriptsPage(QWidget):
         lay.addLayout(run_bar)
         lay.addWidget(QLabel("<b>Result</b>"))
         lay.addWidget(self.d_result)
-        lay.addWidget(QLabel("<i>Scheduled scripts run only while CloudAI is open. Scripts run with your "
+        lay.addWidget(QLabel("<i>Scheduled scripts run only while Kintsugi is open. Scripts run with your "
                              "'Write' connection (Connections page).</i>"))
         return w
 
@@ -215,7 +273,8 @@ class ScriptsPage(QWidget):
     def _show_detail(self, row: dict):
         self.current = row
         self._set_editing(False)
-        warn = "  <span style='color:#c0392b'>⚠ DESTRUCTIVE (needs a typed confirmation)</span>" if row["destructive"] else ""
+        warn = ("  <span style='color:#c0392b'>Needs a typed confirmation (deletes resources or changes "
+                "IAM access)</span>" if row["destructive"] else "")
         self.d_title.setText(f"<h3>Script #{row['id']}: {row['title']}{warn}</h3>")
         meta = [f"<b>Status:</b> {STATUS_ICON.get(row['status'], row['status'])}",
                 f"<b>Region:</b> {row['region']}", f"<b>Steps:</b> {len(row['steps'])}",
@@ -251,7 +310,7 @@ class ScriptsPage(QWidget):
         hint = {"draft": "Read the script, then Approve or Deny it. Run and Schedule unlock after you approve.",
                 "approved": "Approved. You can Run now or Schedule it.",
                 "denied": "Denied. It cannot run. Approve it if you change your mind, edit it, or delete it.",
-                "scheduled": "Approved and scheduled.", "running": "Running…",
+                "scheduled": "Approved and scheduled.", "running": "Running...",
                 "succeeded": "Finished. Edit it if you want to run a changed version (needs approval again).",
                 "failed": "The last run failed. You can run it again (still approved) or edit it."}.get(st, "")
         tip = "" if runnable else "Approve the script first"
@@ -259,7 +318,6 @@ class ScriptsPage(QWidget):
             b.setToolTip(tip)
         self.review_state.setText(f"<i>{hint}</i>")
 
-    # ================= review: approve / deny / edit =================
     def _reload(self, row=None):
         if row:
             self._show_detail(row)
@@ -323,7 +381,6 @@ class ScriptsPage(QWidget):
         if "no longer exists" in msg:
             self._open_failed(msg)
 
-    # ================= run =================
     def _confirm(self, verb: str) -> str | None:
         """Destructive scripts need a typed confirmation. Returns the typed text, or None if cancelled."""
         row = self.current
@@ -332,11 +389,12 @@ class ScriptsPage(QWidget):
             return "" if ok == QMessageBox.Yes else None
         phrase = scripts.confirm_phrase(row["id"])
         text, ok = QInputDialog.getText(self, "Typed confirmation required",
-                                        f"This script deletes or removes AWS resources.\nType exactly:  {phrase}")
+                                        f"This script deletes AWS resources or changes IAM access.\n"
+                                        f"Type exactly:  {phrase}")
         return text if ok else None
 
     def _after_run(self, r: dict):
-        self.d_result.setPlainText(("✅ Finished\n" if r["ok"] else "❌ Failed\n") + r["log"])
+        self.d_result.setPlainText(("Finished\n" if r["ok"] else "Failed\n") + r["log"])
         self.refresh()
         self.on_activity()
         if self.current:
@@ -348,23 +406,28 @@ class ScriptsPage(QWidget):
         if typed is None:
             return
         self.run_btn.setEnabled(False)
-        self.d_result.setPlainText("Running… (steps that wait, like a NAT gateway, can take a few minutes)")
+        self.delete_btn.setEnabled(False)
+        self.d_result.setPlainText("Running... live output below. Long steps (NAT gateway, Docker build, EKS cluster "
+                                   "creation) can take many minutes; you can keep using the app.")
         self.pool.start(scripts.run_script, self.owner, self.current["id"], self.conn, typed,
-                        on_done=self._after_run, on_fail=lambda m: (self.d_result.setPlainText(f"❌ {m}"),
-                                                                    self._update_buttons()))
+                        on_done=self._after_run, on_progress=self._progress,
+                        on_fail=lambda m: (self.d_result.setPlainText(f"Error: {m}"), self._update_buttons()))
+
+    def _progress(self, line: str):
+        self.d_result.appendPlainText(line)
 
     def dry_run(self):
-        self.d_result.setPlainText("Checking (dry run, nothing is changed)…")
+        self.d_result.setPlainText("Checking (dry run, nothing is changed)...")
         self.pool.start(scripts.run_script, self.owner, self.current["id"], self.conn, dry_run=True,
                         on_done=lambda r: self.d_result.setPlainText(
                             {True: "Dry run OK\n", False: "Dry run found a problem\n"}.get(r["ok"], "") + r["log"]),
-                        on_fail=lambda m: self.d_result.setPlainText(f"❌ {m}"))
+                        on_fail=lambda m: self.d_result.setPlainText(f"Error: {m}"))
 
     def schedule(self):
         q = self.when.dateTime()
         d, t = q.date(), q.time()
         run_at = datetime(d.year(), d.month(), d.day(), t.hour(), t.minute(), tzinfo=LOCAL_TZ)
-        typed = self._confirm(f"Schedule for {run_at:%Y-%m-%d %H:%M} —")
+        typed = self._confirm(f"Schedule for {run_at:%Y-%m-%d %H:%M} -")
         if typed is None:
             return
         self.pool.start(scripts.schedule_script, self.owner, self.current["id"], run_at, typed,
@@ -381,7 +444,6 @@ class ScriptsPage(QWidget):
         self.pool.start(scripts.delete_script, self.owner, self.current["id"],
                         on_done=lambda _: (setattr(self, "current", None), self.show_list()), on_fail=self._error)
 
-    # ================= timer (every 30 s from the main window) =================
     def tick(self, on_ran):
         """Run due scheduled scripts and keep the list fresh (scripts can change from chat or other runs)."""
         self.pool.start(scripts.run_due_scripts, self.owner, self.conn,

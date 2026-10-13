@@ -46,8 +46,18 @@ class TestVault(unittest.TestCase):
     def test_rejects_root(self):
         with self.assertRaises(VaultError):
             vault.verify_identity(_Session("arn:aws:iam::123456789012:root"))
-        ident = vault.verify_identity(_Session("arn:aws:iam::123456789012:user/cloudai-readonly"))
+        ident = vault.verify_identity(_Session("arn:aws:iam::123456789012:user/kintsugi-readonly"))
         self.assertEqual(ident["account"], "123456789012")
+        self.assertEqual((ident["principal_type"], ident["user_name"]), ("IAM user", "kintsugi-readonly"))
+
+    def test_owner_name_from_arn(self):
+        cases = {"arn:aws:iam::123456789012:user/alice": ("IAM user", "alice"),
+                 "arn:aws:iam::123456789012:user/team/dev/bob": ("IAM user", "bob"),
+                 "arn:aws:sts::123456789012:assumed-role/kintsugi-ops/kintsugi-operate": ("role", "kintsugi-ops"),
+                 "arn:aws:sts::123456789012:federated-user/carol": ("federated user", "carol")}
+        for arn, want in cases.items():
+            with self.subTest(arn=arn):
+                self.assertEqual(vault.principal_from_arn(arn), want)
 
     def test_key_hint(self):
         self.assertEqual(vault.key_hint("AKIAIOSFODNN7EXAMPLE"), "MPLE")

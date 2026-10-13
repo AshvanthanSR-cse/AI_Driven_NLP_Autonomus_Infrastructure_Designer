@@ -15,9 +15,11 @@ def step(service, operation, params, **extra):
 
 class TestWritePolicy(unittest.TestCase):
     def test_blocked(self):
-        for svc, op, params in [("iam", "create_user", {}), ("organizations", "leave_organization", {}),
-                                ("cloudtrail", "stop_logging", {}), ("s3", "put_bucket_policy", {}),
-                                ("ec2", "describe_instances", {}),  # a read, not a write
+        for svc, op, params in [("iam", "create_access_key", {}), ("organizations", "leave_organization", {}),
+                                ("iam", "attach_role_policy", {"PolicyArn": "arn:aws:iam::aws:policy/AdministratorAccess"}),
+                                ("sts", "assume_role", {}),
+                                ("cloudtrail", "stop_logging", {}), ("s3", "put_bucket_acl", {}),
+                                ("ec2", "describe_instances", {}),
                                 ("EC2", "stop_instances", {})]:
             with self.subTest(op=f"{svc}.{op}"), self.assertRaises(ScriptError):
                 scripts.check_write_allowed(svc, op, params)
@@ -32,6 +34,28 @@ class TestWritePolicy(unittest.TestCase):
         web = {"GroupId": "sg-1", "IpPermissions": [
             {"IpProtocol": "tcp", "FromPort": 80, "ToPort": 80, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}]}
         scripts.check_write_allowed("ec2", "authorize_security_group_ingress", web)
+
+    def test_iam_allowed_with_typed_confirmation(self):
+        st = step("iam", "create_user", {"UserName": "dev-1"})
+        scripts.validate_step(st)
+        self.assertTrue(scripts.needs_confirmation(st))
+        self.assertTrue(ScriptDraft("x", [st]).destructive)
+        self.assertFalse(scripts.needs_confirmation(step("ec2", "stop_instances", {"InstanceIds": ["i-1"]})))
+
+    def test_iam_policy_documents(self):
+        admin = {"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "*", "Resource": "*"}]}
+        iam_all = {"Statement": [{"Effect": "Allow", "Action": ["iam:*"], "Resource": ["*"]}]}
+        not_action = {"Statement": [{"Effect": "Allow", "NotAction": "s3:*", "Resource": "*"}]}
+        anyone = {"Statement": [{"Effect": "Allow", "Principal": {"AWS": "*"}, "Action": "sts:AssumeRole"}]}
+        ok = {"Statement": [{"Effect": "Allow", "Action": ["s3:GetObject"], "Resource": "arn:aws:s3:::b/*"}]}
+        for doc in (admin, iam_all, not_action):
+            with self.subTest(doc=doc), self.assertRaises(ScriptError):
+                scripts.check_write_allowed("iam", "put_role_policy", {"PolicyDocument": json.dumps(doc)})
+        with self.assertRaises(ScriptError):
+            scripts.check_write_allowed("iam", "create_role", {"AssumeRolePolicyDocument": json.dumps(anyone)})
+        scripts.check_write_allowed("iam", "put_role_policy", {"PolicyDocument": json.dumps(ok)})
+        fixed = scripts.normalize_params("iam", "create_policy", {"PolicyName": "p", "PolicyDocument": ok})
+        scripts.validate_step(step("iam", "create_policy", fixed))
 
     def test_destructive(self):
         self.assertTrue(scripts.is_destructive("terminate_instances"))
@@ -48,10 +72,10 @@ class TestBotocoreValidation(unittest.TestCase):
         scripts.validate_step(step("ec2", "create_tags", {"Resources": ["i-1"], "Tags": [{"Key": "a", "Value": "b"}]}))
 
     def test_invalid(self):
-        for st in [step("ec2", "stop_instance", {"InstanceIds": ["i-1"]}),          # no such operation
-                   step("ec2", "stop_instances", {"InstanceId": "i-1"}),             # wrong parameter name
-                   step("ec2", "stop_instances", {}),                                # missing required
-                   step("ec2", "stop_instances", {"InstanceIds": "i-1"}),            # wrong type
+        for st in [step("ec2", "stop_instance", {"InstanceIds": ["i-1"]}),
+                   step("ec2", "stop_instances", {"InstanceId": "i-1"}),
+                   step("ec2", "stop_instances", {}),
+                   step("ec2", "stop_instances", {"InstanceIds": "i-1"}),
                    step("notaservice", "do_things", {})]:
             with self.subTest(st=st), self.assertRaises(ScriptError):
                 scripts.validate_step(st)
@@ -124,7 +148,7 @@ class TestRunScript(unittest.TestCase):
     def test_guard_blocks_untagged(self):
         row = _row()
         row["steps"][0]["params"]["InstanceIds"] = ["i-0bbbbbbbbbbbbbbb2"]
-        row["steps"][0]["guard"]["ec2_tag"]["instance_id"] = "i-0bbbbbbbbbbbbbbb2"  # prod-db, no Env=demo
+        row["steps"][0]["guard"]["ec2_tag"]["instance_id"] = "i-0bbbbbbbbbbbbbbb2"
         res = self._run(row)
         self.assertFalse(res["ok"])
         self.assertEqual(self.ec2.calls, [])
@@ -143,7 +167,6 @@ class TestRunScript(unittest.TestCase):
                 self._run(_row(status=status))
             self.assertIn("Approve", str(cm.exception))
         self.assertEqual(self.ec2.calls, [])
-        # a dry run is always allowed (it changes nothing)
         self._run(_row(status="draft"), dry_run=True)
         with mock.patch.object(scripts, "get_script", return_value=_row(status="draft")), self.assertRaises(ScriptError):
             scripts.schedule_script("tester", 5, datetime.now(timezone.utc) + timedelta(hours=1))
@@ -172,17 +195,18 @@ class TestRunScript(unittest.TestCase):
         self.assertEqual(cols["status"], "draft")
         self.assertIsNone(cols["approved_at"])
         self.assertIn("aws ec2 start-instances", cols["script_text"])
-        self.assertIn("NOTE: COST: cheap", cols["script_text"])          # notes kept
+        self.assertIn("NOTE: COST: cheap", cols["script_text"])
         self.assertFalse(cols["destructive"])
         delete = json.dumps([{"service": "ec2", "operation": "terminate_instances",
                               "params": {"InstanceIds": ["i-0aaaaaaaaaaaaaaa1"]}}])
         self._edit(delete)
-        self.assertTrue(self.sets[-1]["destructive"])                     # now needs typed confirmation
+        self.assertTrue(self.sets[-1]["destructive"])
 
     def test_manual_edit_is_validated(self):
         bad = [("{not json", "Not valid JSON"),
                ("[]", "at least one step"),
-               ('[{"service": "iam", "operation": "create_user", "params": {"UserName": "x"}}]', "blocked"),
+               ('[{"service": "organizations", "operation": "leave_organization", "params": {}}]', "blocked"),
+               ('[{"service": "iam", "operation": "create_access_key", "params": {"UserName": "x"}}]', "IAM console"),
                ('[{"service": "ec2", "operation": "stop_instances", "params": {"InstanceId": "i-1"}}]', "Invalid parameters"),
                ('[{"service": "ec2", "operation": "create_tags", "params": {"Resources": ["vpc-12345678"], "Tags": []}}]', "made-up"),
                ('[{"service": "ec2", "operation": "delete_vpc", "params": {"VpcId": "{{vpc.Vpc.VpcId}}"}}]', "no earlier step"),
@@ -197,7 +221,7 @@ class TestRunScript(unittest.TestCase):
             with self.assertRaises(ScriptError):
                 scripts.schedule_script("tester", 5, datetime.now(timezone.utc) - timedelta(minutes=1))
             with self.assertRaises(ScriptError):
-                scripts.schedule_script("tester", 5, datetime.now() + timedelta(hours=1))  # naive time
+                scripts.schedule_script("tester", 5, datetime.now() + timedelta(hours=1))
 
 
 if __name__ == "__main__":

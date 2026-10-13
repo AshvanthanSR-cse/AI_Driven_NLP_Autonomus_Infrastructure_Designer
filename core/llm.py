@@ -13,7 +13,6 @@ _client: OpenAI | None = None
 def client() -> OpenAI:
     global _client
     if _client is None:
-        # LM Studio ignores the API key, but the SDK requires one.
         _client = OpenAI(base_url=settings.llm_base_url, api_key="lm-studio", timeout=settings.llm_timeout_s)
     return _client
 
@@ -22,7 +21,6 @@ def strip_think(text: str | None) -> str:
     if not text:
         return ""
     text = _THINK_RE.sub("", text)
-    # An unterminated <think> block (truncated output): drop everything after it.
     if "<think>" in text:
         text = text.split("<think>", 1)[0]
     return text.strip()

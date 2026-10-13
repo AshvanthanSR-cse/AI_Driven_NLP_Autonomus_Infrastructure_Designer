@@ -22,7 +22,6 @@ def connect():
             connect_timeout=5,
         )
     except psycopg2.OperationalError as e:
-        # psycopg2 messages contain host/db names but not the password.
         first_line = str(e).strip().splitlines()[-1] if str(e).strip() else "unknown error"
         raise DatabaseError(f"Cannot connect to database '{settings.db_name}': {first_line}") from None
 
@@ -82,8 +81,6 @@ def ensure_schema() -> list[str]:
     return applied
 
 
-# ---- conversations / messages -------------------------------------------------
-
 def new_conversation(title: str) -> int | None:
     try:
         return execute("INSERT INTO conversations (title) VALUES (%s) RETURNING id", (title[:200],))
@@ -100,4 +97,4 @@ def save_message(conversation_id: int | None, role: str, content: str) -> None:
             (conversation_id, role, content),
         )
     except Exception:
-        pass  # chat history is best-effort; never crash the app
+        pass

@@ -3,19 +3,24 @@ import traceback
 
 from PySide6.QtCore import QThread, Signal
 
+from core.clouds import CloudError
 from core.db import DatabaseError
+from core.local_steps import StepError
 from core.scripts import ScriptError
 from core.templates import TemplateError
 from core.tools import ToolError
 from core.vault import VaultError
+from core.workspace import WorkspaceError
 
-EXPECTED_ERRORS = (VaultError, ToolError, DatabaseError, ScriptError, TemplateError)
+EXPECTED_ERRORS = (VaultError, ToolError, DatabaseError, ScriptError, TemplateError, StepError, WorkspaceError, CloudError)
 
 
 class FuncWorker(QThread):
-    """Runs fn(*args, **kwargs) in a background thread; emits done(result) or failed(message)."""
+    """Runs fn(*args, **kwargs) in a background thread; emits done(result) or failed(message).
+    With on_progress, fn also gets progress=<callable> whose lines arrive on the GUI thread."""
     done = Signal(object)
     failed = Signal(str)
+    progress = Signal(str)
 
     def __init__(self, fn, *args, **kwargs):
         super().__init__()
@@ -25,10 +30,8 @@ class FuncWorker(QThread):
         try:
             self.done.emit(self.fn(*self.args, **self.kwargs))
         except EXPECTED_ERRORS as e:
-            # Validation / permission problems: the message is shown in the GUI, no traceback needed.
             self.failed.emit(str(e))
         except Exception as e:
-            # Unexpected bug: messages from core are secret-free; tracebacks go to the console only.
             traceback.print_exc()
             self.failed.emit(f"{type(e).__name__}: {e}")
 
@@ -39,8 +42,11 @@ class WorkerPool:
     def __init__(self):
         self._running: set[FuncWorker] = set()
 
-    def start(self, fn, *args, on_done=None, on_fail=None, **kwargs) -> FuncWorker:
+    def start(self, fn, *args, on_done=None, on_fail=None, on_progress=None, **kwargs) -> FuncWorker:
         w = FuncWorker(fn, *args, **kwargs)
+        if on_progress:
+            w.kwargs["progress"] = w.progress.emit
+            w.progress.connect(on_progress)
         if on_done:
             w.done.connect(on_done)
         if on_fail:

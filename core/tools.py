@@ -1,7 +1,7 @@
 """Typed tools the LLM may choose from. The LLM never calls AWS directly.
 
 Each tool declares: name, pydantic input schema, risk (read | operate | deploy), destructive flag.
-The risk decides which identity is used — chosen here in code, never by the LLM.
+The risk decides which identity is used - chosen here in code, never by the LLM.
 Read tools run immediately. Write tools only produce a ScriptDraft, which is saved to the Scripts page;
 it runs only when the user clicks Run now or at a time the user scheduled (core/scripts.py).
 """
@@ -15,20 +15,20 @@ from zoneinfo import ZoneInfo
 
 from pydantic import BaseModel, Field, ValidationError, field_validator
 
-from core import audit, schedules, scripts, templates
+from core import audit, clouds, prereqs, recipes, schedules, scripts, templates
+from pathlib import Path
 from core.audit import redact
 from core.aws_conn import AwsConnection
 from core.config import PROJECT_ROOT, settings
 from core.scripts import ScriptDraft, ScriptError
 
 
-# ---- framework -----------------------------------------------------------------------
-
 @dataclass
 class ToolContext:
     conn: AwsConnection
-    request: str = ""          # original user request, for the audit log
-    pending_task: dict | None = None   # questions payload the user is currently answering (task templates)
+    request: str = ""
+    pending_task: dict | None = None
+    attachments: list[dict] | None = None
 
     @property
     def owner(self) -> str:
@@ -41,7 +41,7 @@ class Tool:
     description: str
     args_model: type[BaseModel]
     risk: Literal["read", "operate", "deploy"]
-    func: Callable                       # read: func(ctx, args) -> data ; write: func(ctx, args) -> ScriptDraft
+    func: Callable
     destructive: bool = False
 
     @property
@@ -149,7 +149,12 @@ def create_script(name: str, args: BaseModel, ctx: ToolContext) -> dict:
     try:
         draft = tool.func(ctx, args)
         if isinstance(draft, templates.TaskQuestions):
-            return {"questions": draft.to_dict()}  # details missing: nothing saved yet
+            return {"questions": draft.to_dict()}
+        if isinstance(draft, prereqs.PrereqReport):
+            audit.log_action(actor=ctx.owner, request=ctx.request, tool_name=name, tool_args=a, risk=tool.risk,
+                             approval="not_required", status="blocked",
+                             result_summary="prerequisites missing: " + "; ".join(i.title for i in draft.missing))
+            return {"prerequisites": draft.to_dict()}
         saved = scripts.save_draft(ctx.owner, ctx.request, draft)
     except (ToolError, ScriptError, templates.TemplateError) as e:
         audit.log_action(actor=ctx.owner, request=ctx.request, tool_name=name, tool_args=a,
@@ -187,17 +192,14 @@ def _tags(resource: dict) -> dict:
     return {t["Key"]: t["Value"] for t in resource.get("Tags", []) or []}
 
 
-# ---- generic aws_read ------------------------------------------------------------------
-
 READ_PREFIXES = ("list_", "describe_", "get_")
 
-# Operations that return secrets, credentials or object contents. Never reachable from the LLM.
 BLOCKED_OPERATIONS = {
     ("secretsmanager", "get_secret_value"), ("secretsmanager", "batch_get_secret_value"),
     ("secretsmanager", "get_random_password"),
     ("ssm", "get_parameter"), ("ssm", "get_parameters"), ("ssm", "get_parameters_by_path"),
     ("ssm", "get_parameter_history"),
-    ("lambda", "get_function"),            # returns a presigned code download link
+    ("lambda", "get_function"),
     ("ec2", "get_password_data"), ("ec2", "get_console_output"), ("ec2", "get_launch_template_data"),
     ("ecr", "get_authorization_token"), ("ecr-public", "get_authorization_token"),
     ("codeartifact", "get_authorization_token"),
@@ -262,8 +264,6 @@ register(Tool(
     args_model=AwsReadArgs, risk="read", func=aws_read,
 ))
 
-
-# ---- curated read tools (clean, flat output for the 14B model) -----------------------------
 
 class NoArgs(BaseModel):
     pass
@@ -417,14 +417,14 @@ class CostArgs(BaseModel):
 
 
 _COST_CACHE: dict[int, tuple[float, dict]] = {}
-_COST_TTL_S = 6 * 3600  # each Cost Explorer call costs ~$0.01, so cache
+_COST_TTL_S = 6 * 3600
 
 
 def get_cost_by_service(ctx: ToolContext, args: CostArgs):
     cached = _COST_CACHE.get(args.days)
     if cached and time.time() - cached[0] < _COST_TTL_S:
         return {**cached[1], "cached": True}
-    ce = ctx.conn.client("ce", "read", region="us-east-1")  # Cost Explorer endpoint is global (us-east-1)
+    ce = ctx.conn.client("ce", "read", region="us-east-1")
     end = datetime.now(timezone.utc).date()
     start = end - timedelta(days=args.days)
     totals: dict[str, float] = {}
@@ -498,8 +498,6 @@ register(Tool(
 ))
 
 
-# ---- more read tools: load balancers, Lambda code --------------------------------------
-
 def list_load_balancers(ctx: ToolContext, args: NoArgs):
     elb = ctx.conn.client("elbv2", "read")
     rows = []
@@ -551,7 +549,7 @@ def download_lambda_code(ctx: ToolContext, args: LambdaCodeArgs):
     with zipfile.ZipFile(io.BytesIO(blob)) as zf:
         for info in zf.infolist():
             dest = (target / info.filename).resolve()
-            if not str(dest).startswith(str(target)):  # zip-slip protection
+            if not str(dest).startswith(str(target)):
                 continue
             zf.extract(info, target)
             if not info.is_dir():
@@ -568,8 +566,6 @@ register(Tool(
     args_model=LambdaCodeArgs, risk="read", func=download_lambda_code,
 ))
 
-
-# ---- write tools: each one produces a script for the Scripts page ----------------------
 
 DEMO_TAG = ("Env", "demo")
 
@@ -626,7 +622,7 @@ def _s3_create_bucket_region(params: dict, region: str) -> str:
     cfg = params.get("CreateBucketConfiguration") or {}
     location = cfg.get("LocationConstraint")
     if location:
-        region = location  # the bucket's location wins over a mismatched API region
+        region = location
     if region == "us-east-1":
         params.pop("CreateBucketConfiguration", None)
     else:
@@ -637,51 +633,333 @@ def _s3_create_bucket_region(params: dict, region: str) -> str:
 def aws_write(ctx: ToolContext, args: AwsWriteArgs) -> ScriptDraft:
     service, op = args.service.strip().lower(), args.operation.strip()
     region = args.region or settings.aws_region
-    params = dict(args.params)
+    params = scripts.normalize_params(service, op, dict(args.params))
     if service == "s3" and op == "create_bucket":
         region = _s3_create_bucket_region(params, region)
     step = {"service": service, "operation": op, "params": params, "region": region,
             "description": args.title}
-    scripts.validate_step(step)  # policy + botocore parameter validation, before saving
+    scripts.validate_step(step)
+    if ctx is not None and op.startswith("create_"):
+        problems = prereqs.check_references(service, op, params, templates.Env(ctx.conn, region))
+        if problems:
+            raise ToolError("Prerequisite missing: " + "; ".join(problems) + ". Create it first (call "
+                            f"check_prerequisites for {service} to see the full checklist), then ask again.")
     return ScriptDraft(title=args.title, steps=[step], region=region)
 
 
 register(Tool(
     name="aws_write",
-    description=("Create a script (saved on the Scripts page) for any other AWS change, as one boto3 call. "
-                 "The user reviews it and runs or schedules it. IAM, billing and account changes are blocked."),
+    description=("Create a script (saved on the Scripts page) for any other single AWS change, as one boto3 call "
+                 "(any service, including IAM users/roles/policies). The user reviews it and runs or schedules it. "
+                 "Organizations/account changes, creating access keys or passwords, and AdministratorAccess "
+                 "grants are blocked. For multi-step builds use plan_task."),
     args_model=AwsWriteArgs, risk="operate", func=aws_write,
 ))
 
 
+TEMPLATE_HELP = {
+    "vpc_network": "VPC with public/private subnets, internet gateway, route tables, optional NAT",
+    "ec2_instance": "launch one EC2 instance",
+    "iam_role": "IAM role for a service with managed policies",
+    "lambda_function": "create or update a Lambda function from a local code folder, optional schedule",
+    "docker_image": "docker build a local Dockerfile folder and push it to ECR",
+    "ecs_fargate_service": "run a local Dockerfile app on ECS Fargate (ECR + cluster + service + public IP)",
+    "eks_cluster": "EKS Kubernetes cluster with eksctl, optionally deploy a Dockerfile app or YAML manifests",
+    "jenkins_server": "Jenkins CI server on EC2",
+    "ansible_website": "deploy a local website folder (static or Flask) to a running instance with Ansible + nginx",
+    "ansible_playbook": "run the user's own Ansible playbook folder on running instances",
+    "terraform_project": "terraform plan/apply/destroy of the user's own .tf folder",
+    "s3_upload": "upload a local file or folder (document, images, backup) to a PRIVATE S3 bucket",
+    "s3_static_website": "host a static website (index.html or site folder) in a PUBLIC S3 bucket: website "
+                         "hosting, Block Public Access off, public-read policy, optional versioning",
+    "database": "create a database: RDS PostgreSQL/MySQL/MariaDB/SQL Server (Express/Web/Standard/Enterprise)/"
+                "Oracle (SE2/EE)/Db2 (SE/AE), Aurora (Serverless v2 or provisioned), DynamoDB table, DocumentDB "
+                "(MongoDB), ElastiCache Redis/Valkey/Memcached. settings='custom' unlocks every option (version, "
+                "class, storage/IOPS, Multi-AZ, replicas, backups, windows, KMS, logs, parameter/option groups, "
+                "deletion protection, DynamoDB indexes/streams/TTL/PITR, extra_params JSON)",
+}
+
+
+def _input_keys_help() -> str:
+    return " ".join(f"{name}: {', '.join(f.key for f in t.fields)}." for name, t in templates.TEMPLATES.items())
+
+
 class PlanTaskArgs(BaseModel):
-    template: Literal["vpc_network", "ec2_instance"] = Field(
-        description="vpc_network: VPC with public/private subnets, internet gateway, route tables, optional NAT. "
-                    "ec2_instance: launch one EC2 instance.")
+    template: Literal[tuple(TEMPLATE_HELP)] = Field(
+        description=" | ".join(f"{k}: {v}" for k, v in TEMPLATE_HELP.items()))
     inputs: dict = Field(default_factory=dict, description=(
-        "ONLY details the user actually said. vpc_network keys: name, cidr, public_subnets, private_subnets, "
-        "azs (list), nat_gateway (yes/no). ec2_instance keys: name, purpose (web/admin/private), "
-        "os (amazon-linux-2023/ubuntu-24.04/windows-2022), instance_type, subnet_id, security_group "
-        "('new' or sg-id), admin_cidr, key_name, volume_gb. Leave out anything the user did not say."))
+        "ONLY details the user actually said (e.g. a folder path, a name). Keys per template: "
+        + _input_keys_help() + " Leave out anything the user did not say; the app asks for the rest."))
+
+
+PATH_FIELDS = {"lambda_function": "source_folder", "docker_image": "app_folder", "ecs_fargate_service": "app_folder",
+               "eks_cluster": "app_folder", "ansible_website": "folder", "ansible_playbook": "folder",
+               "terraform_project": "folder", "s3_upload": "source",
+               "s3_static_website": "source"}
+
+
+def describe_attachment(path: str) -> dict:
+    """{path, kind, type, size_mb} for the chat (never the file contents)."""
+    p = Path(path)
+    kind = "folder" if p.is_dir() else "file"
+    if kind == "file":
+        t = "dockerfile" if p.name.lower().startswith("dockerfile") else (p.suffix.lower().lstrip(".") or "file")
+        size = p.stat().st_size if p.exists() else 0
+    else:
+        from core import workspace
+        t = workspace.detect_project(p) if p.exists() else "missing"
+        size = 0
+    return {"path": str(p), "kind": kind, "type": t, "size_mb": round(size / 1048576, 2)}
+
+
+def _attachment_for(template: str, attachments: list[dict]) -> str | None:
+    """The attachment that fits this recipe best."""
+    if not attachments:
+        return None
+    want = {"docker_image": ("dockerfile", "docker"), "ecs_fargate_service": ("dockerfile", "docker"),
+            "eks_cluster": ("dockerfile", "docker", "yaml", "yml"), "terraform_project": ("terraform",),
+            "lambda_function": ("python", "node"), "ansible_website": ("static", "python", "node"),
+            "s3_static_website": ("html", "htm", "static")}.get(template)
+    if want:
+        for a in attachments:
+            if a["type"] in want:
+                return a["path"]
+    if template in ("ansible_website", "ansible_playbook", "terraform_project", "lambda_function"):
+        folders = [a for a in attachments if a["kind"] == "folder"]
+        return folders[0]["path"] if folders else None
+    return attachments[0]["path"]
 
 
 def plan_task(ctx: ToolContext, args: PlanTaskArgs):
-    """The LLM may guess values; key decisions are only accepted once the user has seen the questions."""
+    """The LLM may guess values; key decisions are only accepted once the user has seen the questions.
+    A file/folder the user attached in chat fills the recipe's path field (and counts as confirmed)."""
     given = {k: v for k, v in args.inputs.items() if v not in (None, "", [])}
+    attached_keys: set[str] = set()
+    field = PATH_FIELDS.get(args.template)
+    if field and ctx.attachments:
+        paths = {a["path"] for a in ctx.attachments}
+        if given.get(field) not in paths:
+            if pick := _attachment_for(args.template, ctx.attachments):
+                given[field] = pick
+        if given.get(field) in paths:
+            attached_keys.add(field)
     pending = ctx.pending_task if ctx.pending_task and ctx.pending_task.get("template") == args.template else None
-    if pending:  # the user is answering earlier questions: merge, and treat what they said now as confirmed
+    if pending:
         inputs = {**pending.get("inputs", {}), **given}
         confirmed = set(pending.get("confirmed", [])) | set(given)
     else:
         inputs = given
-        confirmed = set(given) - templates.must_ask_keys(args.template)
-    return templates.plan(args.template, inputs, ctx.conn, confirmed)
+        confirmed = (set(given) - templates.must_ask_keys(args.template)) | attached_keys
+    return templates.plan(args.template, inputs, ctx.conn, confirmed | attached_keys)
 
 
 register(Tool(
     name="plan_task",
-    description=("Build infrastructure that needs details from the user: a VPC network (subnets, internet "
-                 "gateway, NAT gateway, route tables) or a new EC2 instance. The app asks the user for "
-                 "anything missing, then saves a script on the Scripts page."),
+    description=("Build or deploy something in several steps: VPC network, EC2 instance, IAM role, Lambda from a "
+                 "local folder, Docker image to ECR, app on ECS Fargate, EKS cluster (+ app), Jenkins server, "
+                 "website deploy with Ansible, public static website on S3, your own Ansible playbook, your own Terraform folder, a database "
+                 "(RDS, Aurora, DynamoDB, DocumentDB, Redis). The app asks "
+                 "the user for anything missing, then saves a script on the Scripts page."),
     args_model=PlanTaskArgs, risk="operate", func=plan_task,
+))
+
+
+class PrereqArgs(BaseModel):
+    service: str = Field(description="AWS service the user wants to build/create with, as a boto3 name or a common "
+                                     "word: rds, db2, oracle, sqlserver, dynamodb, neptune, redshift, opensearch, "
+                                     "kafka, efs, eks, ecs, lambda, sqs ...")
+    operation: Optional[str] = Field(default=None, description="Optional boto3 create operation, e.g. create_db_cluster")
+
+
+def check_prerequisites(ctx: ToolContext, args: PrereqArgs):
+    word = args.service.strip().lower()
+    service = prereqs.SERVICE_WORDS.get(word) or prereqs.service_from_text(word) or word
+    engine = recipes.engine_from_text(word) if service == "rds" else None
+    try:
+        report = prereqs.check_service(service, templates.Env(ctx.conn), args.operation, engine)
+    except prereqs.PrereqError as e:
+        raise ToolError(str(e)) from None
+    out = report.to_dict()
+    out["checklist"] = prereqs.format_report(out)
+    return out
+
+
+register(Tool(
+    name="check_prerequisites",
+    description=("BEFORE building or creating anything (any AWS service: RDS, Db2, Oracle, Neptune, Redshift, EKS, "
+                 "OpenSearch ...) or when the user asks what is needed: returns the checklist of what must already "
+                 "exist (VPC/subnets, security groups, subnet groups, IAM roles, licences, local tools), checked "
+                 "live. Show the checklist to the user; missing items must be created first."),
+    args_model=PrereqArgs, risk="read", func=check_prerequisites,
+))
+
+
+class S3ListArgs(BaseModel):
+    bucket: str = Field(description="Bucket name")
+    prefix: str = Field(default="", description="Only keys starting with this (a 'folder'), e.g. documents/")
+
+
+def list_s3_objects(ctx: ToolContext, args: S3ListArgs):
+    s3 = ctx.conn.client("s3", "read")
+    bucket = args.bucket.strip().removeprefix("s3://").strip("/")
+    region = s3.get_bucket_location(Bucket=bucket).get("LocationConstraint") or "us-east-1"
+    s3 = ctx.conn.client("s3", "read", region)
+    rows, total = [], 0
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=args.prefix,
+                                                              PaginationConfig={"MaxItems": 1000}):
+        for o in page.get("Contents", []):
+            total += o["Size"]
+            rows.append({"key": o["Key"], "size_kb": round(o["Size"] / 1024, 1),
+                         "last_modified": _local(o.get("LastModified"))})
+    return {"bucket": bucket, "region": region, "prefix": args.prefix, "count": len(rows),
+            "total_mb": round(total / 1048576, 2), "objects": rows[:200],
+            "note": "showing the first 200" if len(rows) > 200 else ""}
+
+
+register(Tool(
+    name="list_s3_objects",
+    description="List the files (objects) in an S3 bucket, optionally under a folder/prefix, with sizes and dates.",
+    args_model=S3ListArgs, risk="read", func=list_s3_objects,
+))
+
+
+class S3DownloadArgs(BaseModel):
+    bucket: str = Field(description="Bucket name")
+    key: str = Field(description="Object key (file path in the bucket); a key ending in / downloads that folder")
+
+
+S3_DOWNLOAD_DIR = PROJECT_ROOT / "downloads" / "s3"
+_MAX_DOWNLOAD = 500 * 1024 * 1024
+
+
+def download_s3_object(ctx: ToolContext, args: S3DownloadArgs):
+    """Saves to downloads/s3/<bucket>/... on this computer. The contents are never sent to the AI."""
+    bucket = args.bucket.strip().removeprefix("s3://").strip("/")
+    region = ctx.conn.client("s3", "read").get_bucket_location(Bucket=bucket).get("LocationConstraint") or "us-east-1"
+    s3 = ctx.conn.client("s3", "read", region)
+    key = args.key.lstrip("/")
+    if key.endswith("/") or not key:
+        keys = [(o["Key"], o["Size"]) for page in s3.get_paginator("list_objects_v2").paginate(
+            Bucket=bucket, Prefix=key, PaginationConfig={"MaxItems": 1000}) for o in page.get("Contents", [])
+            if not o["Key"].endswith("/")]
+    else:
+        keys = [(key, s3.head_object(Bucket=bucket, Key=key)["ContentLength"])]
+    if sum(sz for _, sz in keys) > _MAX_DOWNLOAD:
+        raise ToolError("more than 500 MB; download a smaller folder")
+    base = (S3_DOWNLOAD_DIR / bucket).resolve()
+    saved = []
+    for k, _ in keys:
+        dest = (base / k).resolve()
+        if not str(dest).startswith(str(base)):
+            continue
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        s3.download_file(bucket, k, str(dest))
+        saved.append(k)
+    return {"bucket": bucket, "saved_to": str(base), "files": saved[:50], "file_count": len(saved),
+            "note": "Files were saved on this computer; their contents were not sent to the AI."}
+
+
+register(Tool(
+    name="download_s3_object",
+    description="Download a file (or a folder: key ending in /) from S3 to this computer's downloads folder.",
+    args_model=S3DownloadArgs, risk="read", func=download_s3_object,
+))
+
+
+class CloudArgs(BaseModel):
+    provider: Literal["azure", "gcp"] = Field(description="azure = Microsoft Azure, gcp = Google Cloud")
+
+
+def _cloud(ctx: ToolContext, provider: str, purpose: str = "read"):
+    try:
+        return clouds.connector(ctx.owner, provider, purpose)
+    except clouds.CloudError as e:
+        raise ToolError(str(e)) from None
+
+
+def list_cloud_vms(ctx: ToolContext, args: CloudArgs):
+    try:
+        rows = _cloud(ctx, args.provider).list_vms()
+    except clouds.CloudError as e:
+        raise ToolError(f"{clouds.PROVIDERS[args.provider]}: {e}") from None
+    return {"provider": clouds.PROVIDERS[args.provider], "count": len(rows),
+            "vms": [{k: v for k, v in r.items() if k != "tags"} for r in rows]}
+
+
+register(Tool(
+    name="list_cloud_vms",
+    description="List virtual machines in Azure or Google Cloud (name, location, state, size). For AWS use list_ec2_instances.",
+    args_model=CloudArgs, risk="read", func=list_cloud_vms,
+))
+
+
+def list_cloud_storage(ctx: ToolContext, args: CloudArgs):
+    try:
+        rows = _cloud(ctx, args.provider).list_storage()
+    except clouds.CloudError as e:
+        raise ToolError(f"{clouds.PROVIDERS[args.provider]}: {e}") from None
+    return {"provider": clouds.PROVIDERS[args.provider], "count": len(rows), "storage": rows}
+
+
+register(Tool(
+    name="list_cloud_storage",
+    description="List storage in Azure (account/container) or Google Cloud (buckets). For AWS use list_s3_buckets.",
+    args_model=CloudArgs, risk="read", func=list_cloud_storage,
+))
+
+
+class CloudVmActionArgs(CloudArgs):
+    vm: str = Field(description="VM name (or full id)")
+    action: Literal["start", "stop"] = Field(description="start or stop (Azure stop = deallocate, no compute bill)")
+
+
+def cloud_vm_action(ctx: ToolContext, args: CloudVmActionArgs) -> ScriptDraft:
+    try:
+        vm = _cloud(ctx, args.provider).find_vm(args.vm.strip())
+    except clouds.CloudError as e:
+        raise ToolError(str(e)) from None
+    name = clouds.PROVIDERS[args.provider]
+    return ScriptDraft(title=f"{args.action.capitalize()} {name} VM {vm['name']}", steps=[{
+        "kind": "cloud", "provider": args.provider, "action": f"vm_{args.action}",
+        "params": {"vm": vm["id"]}, "description": f"{args.action.capitalize()} {vm['name']} ({vm.get('location', '')})"}],
+        notes=[f"{name}: runs with your {name} Write connection."])
+
+
+register(Tool(
+    name="cloud_vm_action",
+    description="Create a script (Scripts page) that starts or stops an Azure or Google Cloud VM. For AWS use stop_instance/start_instance.",
+    args_model=CloudVmActionArgs, risk="operate", func=cloud_vm_action,
+))
+
+
+class CloudUploadArgs(CloudArgs):
+    source: str = Field(description="Local file or folder path (an attached path)")
+    bucket: str = Field(description="GCS bucket name, or for Azure 'storageaccount/container'")
+    prefix: str = Field(default="", description="Folder inside the bucket/container")
+
+
+def cloud_upload(ctx: ToolContext, args: CloudUploadArgs) -> ScriptDraft:
+    src = args.source
+    if ctx.attachments and src not in {a["path"] for a in ctx.attachments}:
+        src = ctx.attachments[0]["path"]
+    if not Path(src).exists():
+        raise ToolError(f"file or folder not found: {src}")
+    try:
+        names = [s["name"] for s in _cloud(ctx, args.provider).list_storage()]
+    except clouds.CloudError as e:
+        raise ToolError(str(e)) from None
+    if args.bucket not in names:
+        raise ToolError(f"'{args.bucket}' not found. Available: {', '.join(names[:20]) or 'none'}")
+    name = clouds.PROVIDERS[args.provider]
+    return ScriptDraft(title=f"Upload {Path(src).name} to {name} {args.bucket}", steps=[{
+        "kind": "cloud", "provider": args.provider, "action": "upload",
+        "params": {"source": src, "bucket": args.bucket, "prefix": args.prefix},
+        "description": f"Upload {Path(src).name} to {args.bucket}/{args.prefix}"}],
+        notes=["Secret-looking files (.env, keys) are skipped. Files over 256 MB need the provider's CLI."])
+
+
+register(Tool(
+    name="cloud_upload",
+    description="Create a script that uploads a local file/folder to Azure Blob storage or a Google Cloud Storage bucket. For AWS S3 use plan_task s3_upload.",
+    args_model=CloudUploadArgs, risk="operate", func=cloud_upload,
 ))

@@ -16,7 +16,6 @@ from typing import Any, Callable
 from core import audit, scripts
 from core.scripts import ScriptDraft
 
-# Approximate on-demand prices, us-east-1, Linux, USD at time of writing. Verify current pricing.
 HOURLY_PRICE = {"t2.micro": 0.0116, "t3.micro": 0.0104, "t2.small": 0.023, "t3.small": 0.0208,
                 "t3.medium": 0.0416}
 NAT_HOURLY, PUBLIC_IPV4_HOURLY, NAT_PER_GB, GP3_GB_MONTH = 0.045, 0.005, 0.045, 0.08
@@ -31,8 +30,8 @@ class TemplateError(ValueError):
 class Question:
     key: str
     question: str
-    kind: str                      # choice | multichoice | text | number
-    options: list[dict] = field(default_factory=list)   # [{"value": ..., "label": ...}]
+    kind: str
+    options: list[dict] = field(default_factory=list)
     default: Any = None
     why: str = ""
     error: str = ""
@@ -43,15 +42,16 @@ class Question:
 class TaskQuestions:
     template: str
     title: str
-    inputs: dict                   # everything known so far (validated values + suggestions)
+    inputs: dict
     questions: list[Question]
     notes: list[str]
-    confirmed: list[str] = field(default_factory=list)   # keys the user has already answered
+    confirmed: list[str] = field(default_factory=list)
+    prerequisites: dict | None = None
 
     def to_dict(self) -> dict:
         return {"template": self.template, "title": self.title, "inputs": self.inputs,
                 "questions": [asdict(q) for q in self.questions], "notes": self.notes,
-                "confirmed": self.confirmed}
+                "confirmed": self.confirmed, "prerequisites": self.prerequisites}
 
 
 @dataclass
@@ -60,13 +60,15 @@ class FieldSpec:
     question: str
     kind: str
     why: str = ""
-    must_ask: bool = False         # always confirmed by the user, even if the LLM filled it
-    default: Any = None            # value or fn(env, inputs)
-    options: Callable | None = None     # fn(env, inputs) -> [{"value","label"}]
-    validate: Callable | None = None    # fn(env, inputs, value) -> normalized value (raise ValueError)
-    relevant: Callable | None = None    # fn(inputs) -> bool
+    must_ask: bool = False
+    default: Any = None
+    options: Callable | None = None
+    validate: Callable | None = None
+    relevant: Callable | None = None
+    relevant_env: Callable | None = None
     allow_custom: bool = False
-    empty_hint: str = ""                # shown when a choice has no options in the user's account
+    empty_hint: str = ""
+    allow_empty: bool = False
 
 
 @dataclass
@@ -74,9 +76,9 @@ class Template:
     name: str
     description: str
     fields: list[FieldSpec]
-    title: Callable                # fn(inputs) -> str
-    build: Callable                # fn(env, values) -> ScriptDraft
-    notes: Callable                # fn(inputs) -> list[str]
+    title: Callable
+    build: Callable
+    notes: Callable
 
 
 class Env:
@@ -101,11 +103,14 @@ class Env:
 
     def subnets(self) -> list[dict]:
         def load():
-            vpcs = {v["VpcId"]: _name(v) for v in self.ec2().describe_vpcs()["Vpcs"]}
+            raw = self.ec2().describe_vpcs()["Vpcs"]
+            vpcs = {v["VpcId"]: _name(v) for v in raw}
+            vpc_cidrs = {v["VpcId"]: v.get("CidrBlock", "") for v in raw}
             out = []
             for s in self.ec2().describe_subnets()["Subnets"]:
                 out.append({"id": s["SubnetId"], "cidr": s["CidrBlock"], "az": s["AvailabilityZone"],
                             "vpc": s["VpcId"], "vpc_name": vpcs.get(s["VpcId"], ""), "name": _name(s),
+                            "vpc_cidr": vpc_cidrs.get(s["VpcId"], ""),
                             "public": bool(s.get("MapPublicIpOnLaunch"))})
             return sorted(out, key=lambda x: (x["vpc"], not x["public"], x["az"], x["cidr"]))
         return self._memo("subnets", load)
@@ -131,6 +136,88 @@ class Env:
                 return None
         return self._memo("myip", load)
 
+    @property
+    def region_name(self) -> str:
+        from core.config import settings
+        return self.region or settings.aws_region
+
+    def account_id(self) -> str:
+        return self._memo("account", lambda: self.conn.client("sts", "read", self.region)
+                          .get_caller_identity()["Account"])
+
+    def roles(self, principal: str) -> list[dict]:
+        """IAM roles whose trust policy allows the given service principal (e.g. lambda.amazonaws.com)."""
+        def load():
+            iam = self.conn.client("iam", "read", self.region)
+            out = []
+            for page in iam.get_paginator("list_roles").paginate():
+                for r in page["Roles"]:
+                    doc = r.get("AssumeRolePolicyDocument") or {}
+                    if isinstance(doc, str):
+                        import json as _json
+                        import urllib.parse
+                        doc = _json.loads(urllib.parse.unquote(doc))
+                    services = [s for st in doc.get("Statement", [])
+                                for s in _listify((st.get("Principal") or {}).get("Service"))]
+                    if principal in services:
+                        out.append({"name": r["RoleName"], "arn": r["Arn"]})
+            return sorted(out, key=lambda x: x["name"])
+        return self._memo(("roles", principal), load)
+
+    def instances(self) -> list[dict]:
+        """Running instances (for Ansible targets)."""
+        def load():
+            out = []
+            for page in self.ec2().get_paginator("describe_instances").paginate(
+                    Filters=[{"Name": "instance-state-name", "Values": ["running"]}]):
+                for res in page["Reservations"]:
+                    for i in res["Instances"]:
+                        out.append({"id": i["InstanceId"], "name": _name(i), "ip": i.get("PublicIpAddress", ""),
+                                    "image": i.get("ImageId", ""), "platform": i.get("PlatformDetails", ""),
+                                    "sgs": [g["GroupId"] for g in i.get("SecurityGroups", [])]})
+            return out
+        return self._memo("instances", load)
+
+    def image_name(self, image_id: str) -> str:
+        def load():
+            imgs = self.ec2().describe_images(ImageIds=[image_id]).get("Images", [])
+            return imgs[0].get("Name", "") if imgs else ""
+        return self._memo(("image", image_id), load)
+
+    def sg_rules(self, group_ids: list[str]) -> list[dict]:
+        """Inbound rules of security groups: [{port_from, port_to, cidrs}]"""
+        def load():
+            rules = []
+            for g in self.ec2().describe_security_groups(GroupIds=group_ids)["SecurityGroups"]:
+                for p in g.get("IpPermissions", []):
+                    rules.append({"from": p.get("FromPort", 0 if p.get("IpProtocol") == "-1" else None),
+                                  "to": p.get("ToPort", 65535 if p.get("IpProtocol") == "-1" else None),
+                                  "cidrs": [r["CidrIp"] for r in p.get("IpRanges", [])]})
+            return rules
+        return self._memo(("sgrules", tuple(group_ids)), load)
+
+    def lambda_function(self, name: str) -> dict | None:
+        def load():
+            try:
+                return self.conn.client("lambda", "read", self.region).get_function_configuration(FunctionName=name)
+            except Exception as e:
+                if getattr(e, "response", {}).get("Error", {}).get("Code") == "ResourceNotFoundException":
+                    return None
+                raise
+        return self._memo(("lambda", name), load)
+
+    def ecr_repo_uri(self, name: str) -> str | None:
+        def load():
+            try:
+                repos = self.conn.client("ecr", "read", self.region).describe_repositories(
+                    repositoryNames=[name])["repositories"]
+                return repos[0]["repositoryUri"] if repos else None
+            except Exception as e:
+                if getattr(e, "response", {}).get("Error", {}).get("Code") == "RepositoryNotFoundException":
+                    return None
+                raise
+        return self._memo(("ecr", name), load)
+
     def ami(self, os_key: str) -> dict:
         """Latest official AMI for the chosen OS (from AWS public SSM parameters) + its root device."""
         def load():
@@ -141,13 +228,17 @@ class Env:
         return self._memo(("ami", os_key), load)
 
 
+def _listify(v) -> list:
+    return [] if v is None else v if isinstance(v, list) else [v]
+
+
 def _name(resource: dict) -> str:
     return next((t["Value"] for t in resource.get("Tags", []) or [] if t["Key"] == "Name"), "")
 
 
 def _tags(rtype: str, name: str, extra: dict | None = None) -> list[dict]:
     expires = (datetime.now(timezone.utc) + timedelta(days=3)).strftime("%Y-%m-%d")
-    tags = {"Name": name, "Project": "cloudai", "CreatedBy": "cloudai", "ExpiresAt": expires, **(extra or {})}
+    tags = {"Name": name, "Project": "kintsugi", "CreatedBy": "kintsugi", "ExpiresAt": expires, **(extra or {})}
     return [{"ResourceType": rtype, "Tags": [{"Key": k, "Value": v} for k, v in tags.items()]}]
 
 
@@ -175,7 +266,7 @@ def _choice(options: list[dict], v, what: str):
     if v in values:
         return v
     low = str(v).strip().lower()
-    for o in options:  # accept a label or a case-insensitive value
+    for o in options:
         if low in (str(o["value"]).lower(), str(o["label"]).lower()):
             return o["value"]
     if not values:
@@ -189,8 +280,6 @@ def _safe_name(env, inputs, v) -> str:
         raise ValueError("use letters, numbers, - or _ (max 40 characters)")
     return v
 
-
-# ---- template 1: VPC network --------------------------------------------------------------
 
 def _subnet_prefix(net: ipaddress.IPv4Network) -> int:
     return max(24, net.prefixlen + 2)
@@ -341,7 +430,7 @@ VPC_TEMPLATE = Template(
     name="vpc_network",
     description="VPC with public/private subnets, internet gateway, route tables and optional NAT gateway",
     fields=[
-        FieldSpec("name", "What name should the VPC have?", "text", default="cloudai-vpc", validate=_safe_name,
+        FieldSpec("name", "What name should the VPC have?", "text", default="kintsugi-vpc", validate=_safe_name,
                   why="Used in the Name tag of every resource."),
         FieldSpec("public_subnets", "How many public subnets?", "number", default=2,
                   validate=lambda e, i, v: _int(v, 1, 3, "public subnets"),
@@ -361,13 +450,11 @@ VPC_TEMPLATE = Template(
                   validate=lambda e, i, v: _yes_no(v), relevant=lambda i: int(i.get("private_subnets", 2) or 0) > 0,
                   why="Needed for updates/downloads from private subnets. It is billed per hour even when idle."),
     ],
-    title=lambda i: f"VPC '{i.get('name', 'cloudai-vpc')}'",
+    title=lambda i: f"VPC '{i.get('name', 'kintsugi-vpc')}'",
     build=_build_vpc,
     notes=_vpc_notes,
 )
 
-
-# ---- template 2: EC2 instance ---------------------------------------------------------------
 
 OS_CHOICES = {
     "amazon-linux-2023": {"label": "Amazon Linux 2023", "ssm": "/aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64", "admin_port": 22, "min_gb": 8},
@@ -454,7 +541,7 @@ def _build_ec2(env, v) -> ScriptDraft:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M")
         add_sg = {"service": "ec2", "operation": "create_security_group", "save_as": "sg",
                   "description": f"Create security group for {name} ({purpose})",
-                  "params": {"GroupName": f"{name}-sg-{stamp}", "Description": f"CloudAI {purpose} security group for {name}",
+                  "params": {"GroupName": f"{name}-sg-{stamp}", "Description": f"Kintsugi {purpose} security group for {name}",
                              "VpcId": sub["vpc"], "TagSpecifications": _tags("security-group", f"{name}-sg")},
                   "undo": {"service": "ec2", "operation": "delete_security_group",
                            "params": {"GroupId": "{{sg.GroupId}}"}, "description": "Delete the security group"}}
@@ -502,7 +589,7 @@ EC2_TEMPLATE = Template(
     name="ec2_instance",
     description="One EC2 instance with OS, subnet, security group, key pair and disk chosen by the user",
     fields=[
-        FieldSpec("name", "What name should the instance have?", "text", default="cloudai-demo",
+        FieldSpec("name", "What name should the instance have?", "text", default="kintsugi-demo",
                   validate=_safe_name, why="Used in the Name tag; you can refer to it by name in chat later."),
         FieldSpec("purpose", "What is the purpose of the instance?", "choice", must_ask=True,
                   options=lambda e, i: PURPOSES, validate=lambda e, i, v: _choice(PURPOSES, v, "purpose"),
@@ -536,15 +623,13 @@ EC2_TEMPLATE = Template(
                   validate=lambda e, i, v: _int(v, OS_CHOICES.get(i.get("os"), {}).get("min_gb", 8), 100, "disk size"),
                   why="gp3, encrypted, deleted together with the instance."),
     ],
-    title=lambda i: f"EC2 instance '{i.get('name', 'cloudai-demo')}'",
+    title=lambda i: f"EC2 instance '{i.get('name', 'kintsugi-demo')}'",
     build=_build_ec2,
     notes=_ec2_notes,
 )
 
 TEMPLATES = {t.name: t for t in (VPC_TEMPLATE, EC2_TEMPLATE)}
 
-
-# ---- planning ---------------------------------------------------------------------------
 
 def _question(f: FieldSpec, env: Env, inputs: dict, default=None, error: str = "") -> Question:
     try:
@@ -563,10 +648,21 @@ def _question(f: FieldSpec, env: Env, inputs: dict, default=None, error: str = "
                     error=error, allow_custom=f.allow_custom)
 
 
+CLOCK_SKEW_CODES = {"RequestTimeTooSkewed", "SignatureDoesNotMatch", "InvalidSignatureException",
+                    "RequestExpired"}
+
+
 def audit_error(e: Exception) -> str:
     resp = getattr(e, "response", None)
     if isinstance(resp, dict):
-        return resp.get("Error", {}).get("Code", type(e).__name__)
+        code = resp.get("Error", {}).get("Code", type(e).__name__)
+        msg = str(resp.get("Error", {}).get("Message", ""))
+        if code in CLOCK_SKEW_CODES and ("time" in msg.lower() or "expired" in msg.lower()
+                                         or code == "RequestTimeTooSkewed"):
+            return (f"{code}: your PC clock or timezone is wrong, so AWS rejects the request. "
+                    "Fix it in Windows Settings > Time & language > Date & time: turn on "
+                    "'Set time automatically' and 'Set time zone automatically', then click 'Sync now'")
+        return code
     return type(e).__name__
 
 
@@ -579,19 +675,33 @@ def plan(template: str, inputs: dict, conn, confirmed: set | None = None, region
         raise TemplateError(f"unknown template '{template}'")
     t = TEMPLATES[template]
     env = Env(conn, region)
-    inputs = {k: v for k, v in (inputs or {}).items() if v not in (None, "", [])}
+    empty_ok = {f.key for f in t.fields if f.allow_empty}
+    inputs = {k: v for k, v in (inputs or {}).items() if v not in (None, "", []) or (k in empty_ok and v == "")}
     confirmed = set(inputs) if confirmed is None else set(confirmed)
+    from core import prereqs
+    report = prereqs.for_template(template, inputs, env)
+    if report and report.blocking:
+        report.confirmed = sorted(confirmed)
+        return report
     values: dict = {}
     questions: list[Question] = []
     for f in t.fields:
         cur = {**inputs, **values}
         if f.relevant and not f.relevant(cur):
             continue
+        if f.relevant_env:
+            try:
+                if not f.relevant_env(env, cur):
+                    continue
+            except Exception:
+                pass
         if f.key in inputs:
             try:
                 val = f.validate(env, cur, inputs[f.key]) if f.validate else inputs[f.key]
             except ValueError as e:
-                questions.append(_question(f, env, cur, default=inputs[f.key], error=str(e)))
+                bad = inputs[f.key]
+                keep = None if f.kind == "text" and isinstance(bad, bool) else bad
+                questions.append(_question(f, env, cur, default=keep, error=str(e)))
                 continue
             except Exception as e:
                 questions.append(_question(f, env, cur, default=inputs[f.key],
@@ -605,9 +715,22 @@ def plan(template: str, inputs: dict, conn, confirmed: set | None = None, region
     merged = {**inputs, **values}
     if questions:
         asked = {q.key for q in questions}
+        report = prereqs.for_template(template, merged, env)
+        if report and report.blocking:
+            report.confirmed = sorted(k for k in confirmed if k in values)
+            return report
         return TaskQuestions(template, t.title(merged), merged, questions, t.notes(merged),
-                             confirmed=sorted(k for k in confirmed if k in values and k not in asked))
-    return t.build(env, values)
+                             confirmed=sorted(k for k in confirmed if k in values and k not in asked),
+                             prerequisites=report.to_dict() if report else None)
+    report = prereqs.for_template(template, values, env)
+    if report and report.blocking:
+        report.confirmed = sorted(confirmed)
+        return report
+    draft = t.build(env, values)
+    if report:
+        draft.notes = ["Prerequisites checked: " + "; ".join(
+            f"{prereqs.STATUS_ICON[i.status]} {i.title}" for i in report.items)] + draft.notes
+    return draft
 
 
 def submit(owner: str, request: str, template: str, inputs: dict, conn, confirmed: set | None = None) -> dict:
@@ -618,6 +741,9 @@ def submit(owner: str, request: str, template: str, inputs: dict, conn, confirme
         raise
     if isinstance(result, TaskQuestions):
         return {"questions": result.to_dict()}
+    from core.prereqs import PrereqReport
+    if isinstance(result, PrereqReport):
+        return {"prerequisites": result.to_dict()}
     saved = scripts.save_draft(owner, request, result)
     audit.log_action(actor=owner, request=request, tool_name=f"template:{template}", tool_args=inputs,
                      risk=result.risk, approval="pending", status="pending",

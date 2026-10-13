@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Kintsugi Demo Site</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main class="card">
+    <h1>Hello from AWS ECS Fargate 🚀</h1>
+    <p>This static site was built from a Dockerfile and deployed by <strong>Kintsugi</strong>,
+       an AI-driven AWS management desktop app (FOAI project).</p>
+    <ul>
+      <li>Image: <code>nginx:alpine</code> + static HTML/CSS/JS</li>
+      <li>Registry: Amazon ECR</li>
+      <li>Runtime: Amazon ECS on AWS Fargate (serverless containers)</li>
+    </ul>
+    <button id="btn">Click me</button>
+    <p id="msg"></p>
+    <footer>Page loaded at <span id="time"></span> (your local time)</footer>
+  </main>
+  <script src="script.js"></script>
+</body>
+</html>

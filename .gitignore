@@ -21,3 +21,5 @@ downloads/
 Admin Access Key.txt
 CLAUDE.md
 LLM_Testing.py
+# Recipe workspace (generated playbooks, zips, kubeconfigs)
+workspace/

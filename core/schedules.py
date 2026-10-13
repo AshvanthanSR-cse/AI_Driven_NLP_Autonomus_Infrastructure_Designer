@@ -42,7 +42,6 @@ def _scheduler_target_function(target: dict) -> str | None:
     name = function_name_from_arn(arn)
     if name:
         return name
-    # Universal target: arn:aws:scheduler:::aws-sdk:lambda:invoke with FunctionName in Input
     if arn.endswith(":aws-sdk:lambda:invoke"):
         try:
             fn = json.loads(target.get("Input") or "{}").get("FunctionName", "")
@@ -61,7 +60,7 @@ def collect_schedules(events_client, scheduler_client) -> tuple[list[dict], list
             for bus_rule in _paginate(events_client, "list_rules", "Rules"):
                 expr = bus_rule.get("ScheduleExpression")
                 if not expr:
-                    continue  # event-pattern rule, not a schedule
+                    continue
                 targets = _paginate(events_client, "list_targets_by_rule", "Targets", Rule=bus_rule["Name"],
                                     **({"EventBusName": bus_rule["EventBusName"]} if bus_rule.get("EventBusName") else {}))
                 for t in targets:

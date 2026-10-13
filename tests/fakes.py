@@ -23,12 +23,11 @@ class FakeEvents(_NoPaginate):
             {"Name": "hello-0830-ist", "ScheduleExpression": "cron(0 3 * * ? *)", "State": "ENABLED"},
             {"Name": "hello-hourly", "ScheduleExpression": "rate(1 hour)", "State": "ENABLED"},
             {"Name": "hello-disabled", "ScheduleExpression": "cron(0 10 * * ? *)", "State": "DISABLED"},
-            {"Name": "s3-events", "EventPattern": "{}", "State": "ENABLED"},              # not a schedule
+            {"Name": "s3-events", "EventPattern": "{}", "State": "ENABLED"},
             {"Name": "sns-nightly", "ScheduleExpression": "cron(0 20 * * ? *)", "State": "ENABLED"},
         ]
 
     def list_rules(self, NextToken=None):
-        # two pages to exercise pagination
         if NextToken is None:
             return {"Rules": self.rules[:3], "NextToken": "p2"}
         return {"Rules": self.rules[3:]}
@@ -36,7 +35,7 @@ class FakeEvents(_NoPaginate):
     def list_targets_by_rule(self, Rule, NextToken=None, **_):
         if Rule == "sns-nightly":
             return {"Targets": [{"Id": "1", "Arn": "arn:aws:sns:ap-south-1:123456789012:topic"}]}
-        return {"Targets": [{"Id": "1", "Arn": lambda_arn("cloudai-demo-hello")}]}
+        return {"Targets": [{"Id": "1", "Arn": lambda_arn("kintsugi-demo-hello")}]}
 
 
 class FakeScheduler(_NoPaginate):
@@ -50,7 +49,7 @@ class FakeScheduler(_NoPaginate):
         if Name == "hello-3pm-ist":
             return {"Name": Name, "GroupName": GroupName, "State": "ENABLED",
                     "ScheduleExpression": "cron(0 15 * * ? *)", "ScheduleExpressionTimezone": "Asia/Kolkata",
-                    "Target": {"Arn": lambda_arn("cloudai-demo-hello")}}
+                    "Target": {"Arn": lambda_arn("kintsugi-demo-hello")}}
         return {"Name": Name, "GroupName": GroupName, "State": "ENABLED",
                 "ScheduleExpression": "cron(0 18 ? * MON-FRI *)", "ScheduleExpressionTimezone": "Asia/Kolkata",
                 "Target": {"Arn": "arn:aws:scheduler:::aws-sdk:lambda:invoke",

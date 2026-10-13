@@ -3,7 +3,7 @@ import json
 from zoneinfo import ZoneInfo
 
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QTableWidget, QTableWidgetItem
+from PySide6.QtWidgets import QAbstractItemView, QTableWidget, QTableWidgetItem
 
 from core.config import settings
 
@@ -49,3 +49,10 @@ def fill_table(table: QTableWidget, rows: list[dict], cols: list[tuple[str, str]
     for r, row in enumerate(rows):
         for c, (key, _) in enumerate(cols):
             table.setItem(r, c, cell(fmt[key](row) if key in fmt else row.get(key)))
+
+
+def style_table(table: QTableWidget):
+    table.setAlternatingRowColors(True)
+    table.setShowGrid(False)
+    table.verticalHeader().setVisible(False)
+    table.setSelectionBehavior(QAbstractItemView.SelectRows)

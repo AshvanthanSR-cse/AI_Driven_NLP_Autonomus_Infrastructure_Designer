@@ -5,7 +5,7 @@ from datetime import datetime, timezone
 from core.schedules import (collect_schedules, function_name_from_arn, parse_hhmm, scheduled_lambdas)
 from tests.fakes import FakeEvents, FakeScheduler
 
-NOW = datetime(2026, 10, 3, 0, 0, tzinfo=timezone.utc)  # 05:30 IST
+NOW = datetime(2026, 10, 3, 0, 0, tzinfo=timezone.utc)
 
 
 class TestCollect(unittest.TestCase):
@@ -13,9 +13,9 @@ class TestCollect(unittest.TestCase):
         entries, warnings = collect_schedules(FakeEvents(), FakeScheduler())
         self.assertEqual(warnings, [])
         sources = {e["source"] for e in entries}
-        self.assertNotIn("EventBridge rule 's3-events'", sources)      # event pattern, not a schedule
-        self.assertNotIn("EventBridge rule 'sns-nightly'", sources)    # SNS target, not Lambda
-        self.assertEqual(len(entries), 7)  # 5 rules (paginated) + 2 schedules
+        self.assertNotIn("EventBridge rule 's3-events'", sources)
+        self.assertNotIn("EventBridge rule 'sns-nightly'", sources)
+        self.assertEqual(len(entries), 7)
         rule_tz = {e["timezone"] for e in entries if e["source"].startswith("EventBridge rule")}
         self.assertEqual(rule_tz, {"UTC"})
 
