@@ -766,6 +766,33 @@ def _implies_custom(t: Template, inputs: dict) -> bool:
     return False
 
 
+def _normalize_numbers(t: Template, inputs: dict) -> dict[str, str]:
+    """Make number fields numbers before anything calls int() on them.
+
+    A list (e.g. subnet CIDRs where a count is expected) becomes its length; a numeric string becomes a number.
+    Anything else is removed from inputs and returned as {key: error} so the field is asked with that error."""
+    errors = {}
+    for f in t.fields:
+        if f.kind != "number" or f.key not in inputs:
+            continue
+        v = inputs[f.key]
+        if isinstance(v, (list, tuple, set)):
+            inputs[f.key] = len(v)
+        elif isinstance(v, bool) or not isinstance(v, (int, float, str)):
+            errors[f.key] = f"{f.key.replace('_', ' ')} must be a whole number"
+        elif isinstance(v, str):
+            try:
+                inputs[f.key] = int(v.strip())
+            except ValueError:
+                try:
+                    inputs[f.key] = float(v.strip())
+                except ValueError:
+                    errors[f.key] = f"{f.key.replace('_', ' ')} must be a whole number, not '{v}'"
+    for k in errors:
+        inputs.pop(k)
+    return errors
+
+
 def plan(template: str, inputs: dict, conn, confirmed: set | None = None, region: str | None = None):
     """Return TaskQuestions (something is missing or must be confirmed) or a ready ScriptDraft.
 
@@ -778,6 +805,7 @@ def plan(template: str, inputs: dict, conn, confirmed: set | None = None, region
     env = Env(conn, region)
     empty_ok = {f.key for f in t.fields if f.allow_empty}
     inputs = {k: v for k, v in (inputs or {}).items() if v not in (None, "", []) or (k in empty_ok and v in ("", []))}
+    bad_numbers = _normalize_numbers(t, inputs)
     confirmed = set(inputs) if confirmed is None else set(confirmed)
     if _implies_custom(t, inputs):
         inputs["settings"] = "custom"
@@ -822,7 +850,7 @@ def plan(template: str, inputs: dict, conn, confirmed: set | None = None, region
             if f.must_ask and f.key not in confirmed:
                 questions.append(_question(f, env, {**inputs, **values}, default=val))
             continue
-        q = _question(f, env, cur)
+        q = _question(f, env, cur, error=bad_numbers.get(f.key, ""))
         questions.append(q)
         if q.default not in (None, "", []):
             provisional[f.key] = q.default

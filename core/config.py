@@ -1,6 +1,8 @@
 """App settings loaded from .env. Secrets are never included in repr() or logs."""
 import getpass
+import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -8,6 +10,7 @@ from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
+PREFS_FILE = PROJECT_ROOT / "user_prefs.json"
 
 
 def _get(name: str, default: str = "") -> str:
@@ -40,7 +43,34 @@ class Settings:
     max_tool_result_chars: int = 6000
 
 
+def _load_prefs() -> dict:
+    try:
+        return json.loads(PREFS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+
+_REGION_RE = re.compile(r"[a-z]{2}(-gov)?-[a-z]+-\d")
+
 settings = Settings()
+_saved_region = _load_prefs().get("aws_region")
+if isinstance(_saved_region, str) and _REGION_RE.fullmatch(_saved_region):
+    object.__setattr__(settings, "aws_region", _saved_region)
+
+
+def set_region(region: str) -> str:
+    """Switch the active AWS region for the whole app and remember it in user_prefs.json."""
+    region = (region or "").strip().lower()
+    if not _REGION_RE.fullmatch(region):
+        raise ValueError(f"'{region}' is not a valid AWS region name (example: us-east-1)")
+    object.__setattr__(settings, "aws_region", region)
+    prefs = _load_prefs()
+    prefs["aws_region"] = region
+    try:
+        PREFS_FILE.write_text(json.dumps(prefs, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+    return region
 
 
 def check_settings() -> list[str]:

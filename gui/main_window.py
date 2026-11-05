@@ -2,15 +2,15 @@
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
-    QFrame, QHBoxLayout, QHeaderView, QLabel, QMainWindow, QPushButton, QTableWidget, QTabWidget,
+    QComboBox, QFrame, QHBoxLayout, QHeaderView, QLabel, QMainWindow, QPushButton, QTableWidget, QTabWidget,
     QVBoxLayout, QWidget,
 )
 
 from core import audit, db, llm, local_steps, scripts
 from core.aws_conn import AwsConnection
-from core.config import check_settings, settings
+from core.config import check_settings, set_region, settings
 from gui.chat_page import ChatPage
-from gui.common import fill_table, style_table
+from gui.common import AWS_REGIONS, fill_table, style_table
 from gui.connections_page import ConnectionsPage
 from gui.scripts_page import ScriptsPage
 from gui.theme import LOGO_MARK, page_title
@@ -161,8 +161,19 @@ class MainWindow(QMainWindow):
         title.setObjectName("AppTitle")
         sub = QLabel("AI-driven cloud management · AWS · Azure · Google Cloud")
         sub.setObjectName("AppSub")
-        self.header_info = QLabel(f"{settings.app_user} · {settings.aws_region} · {settings.app_timezone}")
+        self.header_info = QLabel(f"{settings.app_user} · AWS region")
         self.header_info.setObjectName("AppSub")
+        self.region_box = QComboBox()
+        self.region_box.setEditable(True)
+        self.region_box.addItems(AWS_REGIONS if settings.aws_region in AWS_REGIONS
+                                 else [settings.aws_region] + AWS_REGIONS)
+        self.region_box.setCurrentText(settings.aws_region)
+        self.region_box.setMinimumWidth(150)
+        self.region_box.setToolTip("Region used for chat, lookups and new scripts. Saved scripts keep their own region.")
+        self.region_box.activated.connect(lambda _: self._change_region(self.region_box.currentText()))
+        self.region_box.lineEdit().editingFinished.connect(lambda: self._change_region(self.region_box.currentText()))
+        tz = QLabel(f"· {settings.app_timezone}")
+        tz.setObjectName("AppSub")
         lay.addWidget(logo)
         lay.addSpacing(6)
         lay.addWidget(title)
@@ -170,7 +181,27 @@ class MainWindow(QMainWindow):
         lay.addWidget(sub)
         lay.addStretch()
         lay.addWidget(self.header_info)
+        lay.addSpacing(6)
+        lay.addWidget(self.region_box)
+        lay.addSpacing(6)
+        lay.addWidget(tz)
         return bar
+
+    def _change_region(self, region: str):
+        if region.strip().lower() == settings.aws_region:
+            return
+        try:
+            region = set_region(region)
+        except ValueError as e:
+            self.statusBar().showMessage(str(e), 8000)
+            self.region_box.setCurrentText(settings.aws_region)
+            return
+        if self.region_box.findText(region) < 0:
+            self.region_box.insertItem(0, region)
+        self.region_box.setCurrentText(region)
+        self.connections.region.setCurrentText(region)
+        self.statusBar().showMessage(f"AWS region switched to {region}. New chats, lookups and scripts use it.", 8000)
+        self.chat.append(f"**Region switched to {region}.** Saved scripts keep the region they were created with.")
 
     def _started(self, lines):
         self.statusBar().showMessage(f"User: {settings.app_user} · " + " · ".join(lines[:2]))

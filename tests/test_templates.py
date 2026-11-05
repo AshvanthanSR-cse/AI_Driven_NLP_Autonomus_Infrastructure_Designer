@@ -110,6 +110,24 @@ class TestVpcQuestions(unittest.TestCase):
         q = templates.plan("vpc_network", {"public_subnets": 2, "private_subnets": 0}, conn(), confirmed=set())
         self.assertNotIn("nat_gateway", [x.key for x in q.questions])
 
+    def test_cidr_lists_for_subnet_counts_become_counts(self):
+        """The model sent subnet CIDR lists where counts are expected: no crash, the counts are used."""
+        q = templates.plan("vpc_network", {"name": "my-vpc", "public_subnets": ["10.0.1.0/24"],
+                                           "private_subnets": ["10.0.2.0/24"], "cidr": "10.0.0.0/16",
+                                           "azs": ["us-east-1a", "us-east-1b"]}, conn(), confirmed={"name"})
+        self.assertIsInstance(q, TaskQuestions)
+        self.assertEqual((q.inputs["public_subnets"], q.inputs["private_subnets"]), (1, 1))
+        self.assertIn("nat_gateway", [x.key for x in q.questions])
+        draft = templates.plan("vpc_network", {**FULL_VPC, "public_subnets": ["a"], "private_subnets": "1",
+                                               "nat_gateway": "no"}, conn())
+        self.assertIsInstance(draft, ScriptDraft)
+
+    def test_non_numeric_count_is_asked_with_an_error(self):
+        q = templates.plan("vpc_network", {**FULL_VPC, "public_subnets": "two", "private_subnets": {"n": 1}}, conn())
+        errors = {x.key: x.error for x in q.questions}
+        self.assertIn("whole number", errors["public_subnets"])
+        self.assertIn("whole number", errors["private_subnets"])
+
 
 class TestVpcScript(unittest.TestCase):
     def setUp(self):

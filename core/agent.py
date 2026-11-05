@@ -12,7 +12,7 @@ from core import llm, prereqs, router, tools
 from core.config import settings
 from core.tools import ToolContext, ToolError
 
-SYSTEM_PROMPT = f"""You are Kintsugi, an assistant that manages the user's AWS account (region {settings.aws_region}).
+SYSTEM_PROMPT = f"""You are Kintsugi, an assistant that manages the user's AWS account (region {{region}}).
 You can only act through the provided tools. Rules:
 - Always call a tool to get facts. Never invent instance IDs, names, costs, times or numbers.
 - Copy numbers, times and IDs exactly as the tool returned them. Never do date, time, timezone or cost arithmetic yourself; the tools already did it.
@@ -174,7 +174,7 @@ def _run(user_text: str, ctx: ToolContext, history: list[dict], pending_task: di
     ctx.attachments = attachments or None
     route = None if pending_task else router.route(user_text, attachments)
     state = _Run(ctx, route, isolate_new_tasks)
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages = [{"role": "system", "content": SYSTEM_PROMPT.replace("{region}", settings.aws_region)}]
     messages += history
     if pending_task:
         messages.append({"role": "system", "content": (
